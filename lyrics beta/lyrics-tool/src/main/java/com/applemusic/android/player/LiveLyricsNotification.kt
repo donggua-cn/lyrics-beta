@@ -6,11 +6,19 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.Shader
+import android.graphics.BitmapShader
+import android.graphics.Matrix
+import android.graphics.drawable.Icon
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import com.applemusic.android.lyrics.Lyrics
+import com.applemusic.android.util.ImageLoader
 import com.applemusic.lyricstool.R
 import java.lang.reflect.InvocationTargetException
 
@@ -27,6 +35,9 @@ object LiveLyricsNotification {
     private var appContext: Context? = null
     private var lastSignature: String? = null
     private var lastPromotionStatus: String? = null
+    private var requestedArtworkUrl: String? = null
+    @Volatile private var artworkBitmap: Bitmap? = null
+    @Volatile private var artworkIconBitmap: Bitmap? = null
 
     private val updateTask = object : Runnable {
         override fun run() {
@@ -106,14 +117,30 @@ object LiveLyricsNotification {
             song.catalogId.ifBlank { song.uri.removePrefix("apple:") }
         }
         val currentLyrics = lyrics?.takeIf { lyricsSongId == songId }
-        val position = PlaybackEngine.positionMs()
-        val line = currentLyrics?.let { value ->
-            value.lines.getOrNull(value.indexAt(position))
-                ?.text
-                ?.takeIf { it.isNotBlank() }
+        val artworkUrl = song.coverUrl
+        if (artworkUrl != requestedArtworkUrl) {
+            requestedArtworkUrl = artworkUrl
+            artworkBitmap = null
+            artworkIconBitmap = null
+            if (artworkUrl.isNotBlank()) {
+                ImageLoader.loadBitmap(artworkUrl) { bitmap ->
+                    if (requestedArtworkUrl == artworkUrl) {
+                        artworkBitmap = bitmap
+                        artworkIconBitmap = bitmap?.let(::createCircularArtworkIcon)
+                        lastSignature = null
+                        updateNotification()
+                    }
+                }
+            }
         }
-        val lyricText = line ?: "正在获取歌词…"
-        val signature = "$songId|$lyricText"
+        val position = PlaybackEngine.positionMs()
+        val currentLine = currentLyrics?.let { value ->
+            value.lines.getOrNull(value.indexAt(position))
+        }
+        val lyricText = currentLine?.text?.takeIf { it.isNotBlank() } ?: "正在获取歌词…"
+        val translationText = currentLine?.translation?.takeIf { it.isNotBlank() }
+        val signature =
+            "$songId|$lyricText|$translationText|$artworkUrl|${artworkBitmap != null}"
         if (signature == lastSignature) return
         lastSignature = signature
 
@@ -132,7 +159,10 @@ object LiveLyricsNotification {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
         val builder = Notification.Builder(context, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_notification_transparent)
+            .setSmallIcon(
+                artworkIconBitmap?.let { Icon.createWithBitmap(it) }
+                    ?: Icon.createWithResource(context, R.drawable.ic_notification_transparent)
+            )
             .setWhen(System.currentTimeMillis())
             .setCategory(Notification.CATEGORY_STATUS)
             .setPriority(Notification.PRIORITY_HIGH)
@@ -142,8 +172,9 @@ object LiveLyricsNotification {
             .setContentIntent(contentIntent)
             .setContentTitle(lyricText)
             .setSubText(null)
-            .setContentText(null)
+            .setContentText(translationText)
             .setShortCriticalText(lyricText.take(12))
+            .setLargeIcon(artworkBitmap)
 
         requestPromotion(builder)
         val notification = builder.build()
@@ -156,6 +187,24 @@ object LiveLyricsNotification {
             lastPromotionStatus = promotionStatus
         }
         manager.notify(NOTIFICATION_ID, notification)
+    }
+
+    private fun createCircularArtworkIcon(source: Bitmap): Bitmap {
+        val size = 96
+        val output = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+        val shader = BitmapShader(source, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
+        val scale = size.toFloat() / minOf(source.width, source.height)
+        val scaledWidth = source.width * scale
+        val scaledHeight = source.height * scale
+        val matrix = Matrix().apply {
+            setScale(scale, scale)
+            postTranslate((size - scaledWidth) / 2f, (size - scaledHeight) / 2f)
+        }
+        shader.setLocalMatrix(matrix)
+        paint.shader = shader
+        Canvas(output).drawCircle(size / 2f, size / 2f, size / 2f, paint)
+        return output
     }
 
     private fun requestPromotion(builder: Notification.Builder) {

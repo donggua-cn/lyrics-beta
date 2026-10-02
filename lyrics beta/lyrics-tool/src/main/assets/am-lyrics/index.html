@@ -45,7 +45,7 @@
     let sourceLookupRequest = 0;
     let activeSourceLookupRequest = 0;
     let nativeBlurObserver = null;
-    const nativeBlurLines = new Set();
+    const nativeEffectLines = new Set();
     lyrics.style.height = '100%';
     sourceFetcherHost.style.cssText =
       'position:fixed;left:-200vw;top:0;width:400px;height:700px;' +
@@ -89,24 +89,57 @@
       root.appendChild(style);
     }
 
-    function clearQqDistanceBlur() {
-      for (const line of nativeBlurLines) {
+    function clearInactiveLineEffects() {
+      for (const line of nativeEffectLines) {
         line.style.removeProperty('filter');
+        line.style.removeProperty('opacity');
       }
-      nativeBlurLines.clear();
+      nativeEffectLines.clear();
     }
 
-    function updateQqDistanceBlur() {
+    function darkModeContrastColor(color) {
+      const match = /^#([\da-f]{6})$/i.exec(color);
+      if (!match) return '#f2edff';
+      const channels = [0, 2, 4].map(index =>
+        Number.parseInt(match[1].slice(index, index + 2), 16) / 255
+      );
+      const linear = value => value <= 0.04045
+        ? value / 12.92
+        : ((value + 0.055) / 1.055) ** 2.4;
+      const luminance = values =>
+        0.2126 * linear(values[0]) +
+        0.7152 * linear(values[1]) +
+        0.0722 * linear(values[2]);
+      const backgroundLuminance = luminance([20 / 255, 18 / 255, 24 / 255]);
+      const contrast = values =>
+        (luminance(values) + 0.05) / (backgroundLuminance + 0.05);
+      if (contrast(channels) >= 4.5) return color;
+
+      let low = 0;
+      let high = 1;
+      for (let iteration = 0; iteration < 20; iteration++) {
+        const amount = (low + high) / 2;
+        const blended = channels.map(channel => channel + (1 - channel) * amount);
+        if (contrast(blended) >= 4.5) high = amount;
+        else low = amount;
+      }
+      const result = channels
+        .map(channel => Math.round((channel + (1 - channel) * high) * 255))
+        .map(channel => channel.toString(16).padStart(2, '0'))
+        .join('');
+      return `#${result}`;
+    }
+
+    function updateInactiveLineEffects() {
       const container = lyrics.shadowRoot?.querySelector('.lyrics-container');
       if (
-        !nativeState?.qqQrc ||
         !container?.classList.contains('blur-inactive-enabled') ||
         container.classList.contains('not-focused') ||
         container.classList.contains('user-scrolling') ||
         container.classList.contains('touch-scrolling') ||
         container.classList.contains('wheel-scrolling')
       ) {
-        clearQqDistanceBlur();
+        clearInactiveLineEffects();
         return;
       }
 
@@ -119,7 +152,7 @@
           : []
       );
       if (activeIndices.length === 0) {
-        clearQqDistanceBlur();
+        clearInactiveLineEffects();
         return;
       }
 
@@ -128,40 +161,38 @@
       ) || 0.22;
       const currentLines = new Set();
       lines.forEach((line, index) => {
-        if (line.classList.contains('active') ||
-            line.classList.contains('pre-active') ||
-            line.classList.contains('far-line')) {
-          return;
-        }
-
         const distance = Math.min(
           ...activeIndices.map(activeIndex => Math.abs(index - activeIndex))
         );
         if (distance === 0) return;
-        const blurEm = Math.min(distance * 0.028, maxBlurEm);
-        line.style.setProperty(
-          'filter',
-          `blur(${blurEm.toFixed(3)}em)`,
-          'important'
-        );
+        const opacity = nativeState?.darkTheme
+          ? Math.max(0.72, 0.95 - distance * 0.04)
+          : Math.max(0.46, 0.9 - distance * 0.075);
+        line.style.setProperty('opacity', opacity.toFixed(3));
+        if (nativeState?.qqQrc && !line.classList.contains('far-line')) {
+          const blurEm = Math.min(distance * 0.028, maxBlurEm);
+          line.style.setProperty('filter', `blur(${blurEm.toFixed(3)}em)`, 'important');
+        }
         currentLines.add(line);
       });
 
-      for (const line of nativeBlurLines) {
-        if (!currentLines.has(line)) line.style.removeProperty('filter');
+      for (const line of nativeEffectLines) {
+        if (!currentLines.has(line)) {
+          line.style.removeProperty('filter');
+          line.style.removeProperty('opacity');
+        }
       }
-      nativeBlurLines.clear();
-      currentLines.forEach(line => nativeBlurLines.add(line));
+      nativeEffectLines.clear();
+      currentLines.forEach(line => nativeEffectLines.add(line));
     }
 
-    function scheduleQqDistanceBlur() {
-      if (!nativeState?.qqQrc) return;
-      lyrics.updateComplete?.then(updateQqDistanceBlur);
+    function scheduleInactiveLineEffects() {
+      lyrics.updateComplete?.then(updateInactiveLineEffects);
     }
 
-    function observeQqDistanceBlur() {
+    function observeInactiveLineEffects() {
       if (nativeBlurObserver || !lyrics.shadowRoot) return;
-      nativeBlurObserver = new MutationObserver(scheduleQqDistanceBlur);
+      nativeBlurObserver = new MutationObserver(scheduleInactiveLineEffects);
       nativeBlurObserver.observe(lyrics.shadowRoot, {
         subtree: true,
         childList: true,
@@ -285,7 +316,7 @@
       songId,
       qqQrc
     ) => {
-      if (nativeState?.qqQrc && !qqQrc) clearQqDistanceBlur();
+      if (nativeState?.qqQrc && !qqQrc) clearInactiveLineEffects();
       nativeState = {
         ttml,
         songId: songId || nativeState?.songId,
@@ -295,13 +326,14 @@
         album,
         duration,
         color,
+        darkTheme: Boolean(nativeState?.darkTheme),
         appearance: nativeState?.appearance || "{}",
         showTranslations: nativeState?.showTranslations || false
       };
       if (!lyrics.isConnected || !customElements.get('am-lyrics')) return;
 
       installNativeStyles();
-      observeQqDistanceBlur();
+      observeInactiveLineEffects();
       lyrics.ttml = ttml;
       lyrics.songTitle = title;
       lyrics.songArtist = artist;
@@ -336,20 +368,32 @@
       if (nativeState) nativeState.appearance = appearanceJson;
       const appearance = JSON.parse(appearanceJson);
       const color = appearance.highlightColor || '#6750A4';
+      const lyricColor = appearance.darkTheme ? darkModeContrastColor(color) : color;
       const rootStyle = lyrics.style;
-      rootStyle.setProperty('--am-lyrics-highlight-color', color);
-      rootStyle.setProperty('--highlight-color', color);
+      rootStyle.setProperty('--am-lyrics-highlight-color', lyricColor);
+      rootStyle.setProperty('--highlight-color', lyricColor);
+      rootStyle.setProperty('--lyplus-lyrics-palette', lyricColor);
+      rootStyle.setProperty('--lyplus-text-primary', lyricColor);
+      if (appearance.darkTheme) {
+        rootStyle.setProperty(
+          '--lyplus-text-secondary',
+          `color-mix(in srgb, ${lyricColor}, #ffffff 35%)`
+        );
+      } else {
+        rootStyle.removeProperty('--lyplus-text-secondary');
+      }
       rootStyle.setProperty('--am-lyrics-glow-radius', `${appearance.glowRadius || 0}px`);
       rootStyle.setProperty('--am-lyrics-compact-font-size', `${appearance.fontSize || 28}px`);
       rootStyle.setProperty('--am-lyrics-compact-line-spacing', `${appearance.lineSpacing || 18}px`);
       rootStyle.setProperty('--am-lyrics-highlight-surface', 'transparent');
-      lyrics.highlightColor = color;
+      lyrics.highlightColor = lyricColor;
+      if (nativeState) nativeState.darkTheme = Boolean(appearance.darkTheme);
       lyrics.autoScroll = Boolean(appearance.autoScroll);
       lyrics.interpolate = Boolean(appearance.interpolate);
       lyrics.noBlur = !appearance.blur;
       lyrics.reducedMotion = Boolean(appearance.reducedMotion);
       lyrics.hidePlayedLines = Boolean(appearance.hidePlayedLines);
-      scheduleQqDistanceBlur();
+      scheduleInactiveLineEffects();
     };
 
     window.amLyricsSetSourceMode = (enabled, requestedId) => {
@@ -362,7 +406,7 @@
 
     window.amLyricsSetTime = (timeMs) => {
       lyrics.currentTime = Number(timeMs) || 0;
-      scheduleQqDistanceBlur();
+      scheduleInactiveLineEffects();
     };
 
     lyrics.addEventListener('line-click', event => {
@@ -373,7 +417,7 @@
 
     customElements.whenDefined('am-lyrics').then(() => {
       installNativeStyles();
-      observeQqDistanceBlur();
+      observeInactiveLineEffects();
       if (nativeState) {
         window.amLyricsSetContent(
           nativeState.ttml,

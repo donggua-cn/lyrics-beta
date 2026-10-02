@@ -12,7 +12,7 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * 策略（与原实现一致）：
  *   - 解密后的音频落在 App 私有 cacheDir/apple_music/<id>.m4a
- *   - 上限 3GB，超出按 LRU 淘汰到 90%（pinned 的不动）
+ *   - 用户可设置 0.5–20GB 上限；超出按 LRU 淘汰到 90%（pinned 的不动）
  *   - 索引持久化到 SharedPreferences（JSON），重启后仍能命中
  *   - 小于 128KB 的文件视为损坏（半截文件）直接作废
  *
@@ -27,6 +27,10 @@ class AppleCache(private val context: Context, private val api: AppleApi) {
         private const val PREF = "apple_music_cache"
         private const val KEY_INDEX = "index_json"
         private const val KEY_SCHEMA = "schema_version"
+        private const val KEY_MAX_BYTES = "max_cache_bytes"
+        private const val DEFAULT_MAX_BYTES = 3L * 1024 * 1024 * 1024
+        private const val MIN_MAX_BYTES = 512L * 1024 * 1024
+        private const val MAX_MAX_BYTES = 20L * 1024 * 1024 * 1024
         /**
          * 缓存格式版本：不一致就把整个缓存清掉。
          *
@@ -132,7 +136,6 @@ class AppleCache(private val context: Context, private val api: AppleApi) {
                     ((d[off + 2].toInt() and 0xFF) shl 8) or
                     (d[off + 3].toInt() and 0xFF)
         }
-        private const val MAX_BYTES = 3L * 1024 * 1024 * 1024
         private const val TARGET_RATIO = 0.9
         const val MIN_VALID_BYTES = 128L * 1024
     }
@@ -185,6 +188,17 @@ class AppleCache(private val context: Context, private val api: AppleApi) {
     private val entries = ConcurrentHashMap<String, Entry>()
     private val inflight = ConcurrentHashMap<String, Task>()
     private val prefs = context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+    @Volatile
+    private var maxBytes = prefs.getLong(KEY_MAX_BYTES, DEFAULT_MAX_BYTES)
+
+    fun maxCacheBytes(): Long = maxBytes
+
+    fun setMaxCacheBytes(bytes: Long): Int {
+        val boundedBytes = bytes.coerceIn(MIN_MAX_BYTES, MAX_MAX_BYTES)
+        maxBytes = boundedBytes
+        prefs.edit().putLong(KEY_MAX_BYTES, boundedBytes).apply()
+        return evictIfNeeded()
+    }
 
     fun init() {
         if (!dir.exists()) dir.mkdirs()
@@ -197,6 +211,7 @@ class AppleCache(private val context: Context, private val api: AppleApi) {
         }
         sweepCorrupted()
         sweepTempFiles()
+        evictIfNeeded()
         Logx.i(TAG, "init: dir=${dir.absolutePath} count=${entries.size} bytes=${statsBytes()}")
     }
 
@@ -299,6 +314,7 @@ class AppleCache(private val context: Context, private val api: AppleApi) {
             return null
         }
         e.lastAccess = System.currentTimeMillis()
+        persist()
         return f.absolutePath
     }
 
@@ -535,13 +551,18 @@ class AppleCache(private val context: Context, private val api: AppleApi) {
     @Synchronized
     fun evictIfNeeded(): Int {
         var total = statsBytes()
-        if (total <= MAX_BYTES) return 0
-        val target = (MAX_BYTES * TARGET_RATIO).toLong()
+        val limit = maxBytes
+        if (total <= limit) return 0
+        val target = (limit * TARGET_RATIO).toLong()
         val list = entries.values.filter { !it.pinned }.sortedBy { it.lastAccess }
         var removed = 0
         for (e in list) {
             if (total <= target) break
-            File(dir, e.fileName).delete()
+            val file = File(dir, e.fileName)
+            if (file.exists() && !file.delete()) {
+                Logx.w(TAG, "无法淘汰播放缓存：${file.name}")
+                continue
+            }
             entries.remove(e.songId)
             total -= e.size
             removed++

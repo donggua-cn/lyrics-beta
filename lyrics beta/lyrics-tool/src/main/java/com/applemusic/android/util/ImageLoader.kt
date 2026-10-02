@@ -63,6 +63,22 @@ object ImageLoader {
         }
     }
 
+    fun loadBitmap(url: String, onLoaded: (Bitmap?) -> Unit) {
+        if (url.isEmpty()) {
+            main.post { onLoaded(null) }
+            return
+        }
+        memCache.get(url)?.let { bitmap ->
+            main.post { onLoaded(bitmap) }
+            return
+        }
+        pool.execute {
+            val bitmap = loadBitmap(url)
+            if (bitmap != null) memCache.put(url, bitmap)
+            main.post { onLoaded(bitmap) }
+        }
+    }
+
     private fun apply(view: ImageView, bmp: Bitmap, circle: Boolean) {
         if (circle) {
             val d = RoundedBitmapDrawableFactory.create(view.resources, bmp)
