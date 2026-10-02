@@ -306,6 +306,7 @@ private data class LyricsAppearance(
     val blur: Boolean = false,
     val reducedMotion: Boolean = false,
     val hidePlayedLines: Boolean = false,
+    val traditionalToSimplified: Boolean = false,
     val customFontFileName: String? = null,
     val customFontDisplayName: String? = null
 )
@@ -535,6 +536,10 @@ internal fun LyricsToolScreen(
                     blur = appearancePreferences.getBoolean("blur", false),
                     reducedMotion = appearancePreferences.getBoolean("reduced_motion", false),
                     hidePlayedLines = appearancePreferences.getBoolean("hide_played_lines", false),
+                    traditionalToSimplified = appearancePreferences.getBoolean(
+                        "traditional_to_simplified",
+                        false
+                    ),
                     customFontFileName = appearancePreferences
                         .getString("custom_font_file", null)
                         ?.takeIf { it.matches(Regex("lyrics-[a-f0-9-]+\\.(ttf|otf)")) },
@@ -859,6 +864,7 @@ internal fun LyricsToolScreen(
                 .putBoolean("blur", appearance.blur)
                 .putBoolean("reduced_motion", appearance.reducedMotion)
                 .putBoolean("hide_played_lines", appearance.hidePlayedLines)
+                .putBoolean("traditional_to_simplified", appearance.traditionalToSimplified)
                 .putString("custom_font_file", appearance.customFontFileName)
                 .putString("custom_font_name", appearance.customFontDisplayName)
                 .apply()
@@ -1247,7 +1253,7 @@ internal fun LyricsToolScreen(
                     .fillMaxSize()
                     .padding(padding)
                     .padding(
-                        top = if (immersiveLyrics) playbackCardTopInset
+                        top = if (immersiveLyrics) 0.dp
                         else WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
                     )
             ) {
@@ -1570,7 +1576,10 @@ internal fun LyricsToolScreen(
                                                 sourceLookupInProgress = sourceLookupInProgress,
                                                 sourceLookupRequest = sourceLookupRequest,
                                                 lyricsAppearance = effectiveLyricsAppearance,
+                                                traditionalToSimplified =
+                                                    lyricsAppearance.traditionalToSimplified,
                                                 coverAccentReady = coverAccentReady,
+                                                playbackCardTopInset = playbackCardTopInset,
                                                 accentColor = playbackAccentColor,
                                                 preparing = PlaybackEngine.preparing,
                                                 playbackStatus = playbackStatus,
@@ -2087,7 +2096,7 @@ private fun SongResults(
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 8.dp, bottom = 26.dp),
+        contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 8.dp, bottom = 160.dp),
         verticalArrangement = Arrangement.spacedBy(9.dp)
     ) {
         item {
@@ -2193,7 +2202,9 @@ private fun LyricsDetail(
     sourceLookupInProgress: Boolean,
     sourceLookupRequest: Int,
     lyricsAppearance: LyricsAppearance,
+    traditionalToSimplified: Boolean,
     coverAccentReady: Boolean,
+    playbackCardTopInset: androidx.compose.ui.unit.Dp,
     preparing: Boolean,
     playbackStatus: String,
     fullscreen: Boolean,
@@ -2313,6 +2324,7 @@ private fun LyricsDetail(
                         showTranslations = showTranslations,
                         externalSourceMode = externalSourceMode,
                         appearance = lyricsAppearance,
+                        traditionalToSimplified = traditionalToSimplified,
                         sourceLookupRequest = sourceLookupRequest,
                         onSourceLookupSucceeded = onSourceLookupSucceeded,
                         onSourceLookupFailed = onSourceLookupFailed,
@@ -2535,7 +2547,9 @@ private fun LyricsDetail(
                 dragPositionMs?.let(onSeekTo)
                 dragPositionMs = null
             },
-            modifier = Modifier.align(Alignment.TopCenter)
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .padding(top = playbackCardTopInset)
         )
         }
     }
@@ -2734,6 +2748,18 @@ private fun LyricsAppearanceDialog(
                     onCheckedChange = {
                         onAppearanceChange(appearance.copy(useCoverAccent = it))
                     }
+                )
+                AppearanceSwitch(
+                    label = "繁体歌词转为简体",
+                    checked = appearance.traditionalToSimplified,
+                    onCheckedChange = {
+                        onAppearanceChange(appearance.copy(traditionalToSimplified = it))
+                    }
+                )
+                Text(
+                    "仅影响歌词页显示，不会修改原歌词或导出内容。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
@@ -2967,6 +2993,7 @@ private fun AmLyricsWebView(
     showTranslations: Boolean,
     externalSourceMode: Boolean,
     appearance: LyricsAppearance,
+    traditionalToSimplified: Boolean,
     sourceLookupRequest: Int,
     onSourceLookupSucceeded: (String, String) -> Unit,
     onSourceLookupFailed: () -> Unit,
@@ -2976,8 +3003,8 @@ private fun AmLyricsWebView(
     onSeekTo: (Long) -> Unit
 ) {
     val context = LocalContext.current
-    val ttml = remember(song.id, fetchedLyrics) {
-        fetchedLyrics.lyrics.toAmLyricsTtml()
+    val ttml = remember(song.id, fetchedLyrics, traditionalToSimplified) {
+        fetchedLyrics.lyrics.toAmLyricsTtml(traditionalToSimplified)
     }
     val state = remember(song.id) {
         AmLyricsViewState(
@@ -3246,7 +3273,16 @@ private fun isAllowedLyricsSourceUrl(uri: android.net.Uri): Boolean {
     )
 }
 
-private fun com.applemusic.android.lyrics.Lyrics.toAmLyricsTtml(): String {
+private fun com.applemusic.android.lyrics.Lyrics.toAmLyricsTtml(
+    traditionalToSimplified: Boolean = false
+): String {
+    val simplify: (String) -> String = if (traditionalToSimplified) {
+        val transliterator =
+            android.icu.text.Transliterator.getInstance("Traditional-Simplified")
+        transliterator::transliterate
+    } else {
+        { value -> value }
+    }
     val usedKeys = mutableSetOf<String>()
     val lineKeys = lines.mapIndexed { index, line ->
         val originalKey = line.key?.takeIf { it.isNotBlank() && usedKeys.add(it) }
@@ -3266,7 +3302,7 @@ private fun com.applemusic.android.lyrics.Lyrics.toAmLyricsTtml(): String {
                 append("<text for=\"")
                 append(lineKeys[index].xmlEscaped())
                 append("\">")
-                append(lines[index].translation.orEmpty().xmlEscaped())
+                append(simplify(lines[index].translation.orEmpty()).xmlEscaped())
                 append("</text>")
             }
             append("</translation></translations>")
@@ -3291,7 +3327,7 @@ private fun com.applemusic.android.lyrics.Lyrics.toAmLyricsTtml(): String {
 
             append('>')
             if (line.words.isEmpty()) {
-                append(line.text.xmlEscaped())
+                append(simplify(line.text).xmlEscaped())
             } else {
                 var cursor = 0
                 var cursorTimeMs = start
@@ -3300,14 +3336,14 @@ private fun com.applemusic.android.lyrics.Lyrics.toAmLyricsTtml(): String {
                     val wordEnd = word.charEnd.coerceIn(wordStart, line.text.length)
                     if (wordStart > cursor) {
                         appendTtmlSpan(
-                            line.text.substring(cursor, wordStart),
+                            simplify(line.text.substring(cursor, wordStart)),
                             cursorTimeMs,
                             word.startMs
                         )
                     }
                     if (wordEnd > wordStart) {
                         appendTtmlSpan(
-                            line.text.substring(wordStart, wordEnd),
+                            simplify(line.text.substring(wordStart, wordEnd)),
                             word.startMs,
                             word.endMs
                         )
@@ -3317,7 +3353,7 @@ private fun com.applemusic.android.lyrics.Lyrics.toAmLyricsTtml(): String {
                 }
                 if (cursor < line.text.length) {
                     appendTtmlSpan(
-                        line.text.substring(cursor),
+                        simplify(line.text.substring(cursor)),
                         cursorTimeMs,
                         end
                     )
@@ -3845,7 +3881,8 @@ private fun SettingsPage(
         modifier = modifier
             .fillMaxWidth()
             .verticalScroll(rememberScrollState())
-            .padding(horizontal = 20.dp, vertical = 18.dp),
+            .padding(horizontal = 20.dp)
+            .padding(top = 18.dp, bottom = 160.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
         Text(
