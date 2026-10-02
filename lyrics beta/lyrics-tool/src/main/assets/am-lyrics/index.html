@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <style>
+    html, body {
+      width: 100%;
+      height: 100%;
+      min-height: 100vh;
+      margin: 0;
+      overflow: hidden;
+      background: transparent;
+    }
+
+    am-lyrics {
+      display: block;
+      width: 100%;
+      height: 100%;
+      min-height: 220px;
+      --am-lyrics-highlight-color: #6750a4;
+      --highlight-color: #6750a4;
+      --am-lyrics-highlight-surface: rgba(103, 80, 164, 0.08);
+      --lyplus-font-size-base: 28px;
+      --am-lyrics-line-height: 1.25;
+      --am-lyrics-line-spacing: 18px;
+      --am-lyrics-inline-padding: 8px;
+      --lyrics-scroll-padding-top: 18%;
+      --am-lyrics-compact-font-size: 28px;
+      --am-lyrics-compact-line-spacing: 18px;
+      --am-lyrics-highlight-radius: 12px;
+    }
+  </style>
+  <script type="module" src="am-lyrics.js"></script>
+</head>
+<body>
+  <am-lyrics autoscroll interpolate no-auto-alternates no-blur></am-lyrics>
+  <div id="lyrics-source-fetcher" aria-hidden="true"></div>
+  <script>
+    const lyrics = document.querySelector('am-lyrics');
+    const sourceFetcherHost = document.getElementById('lyrics-source-fetcher');
+    let nativeState = null;
+    let sourceFetcher = null;
+    let sourceFetcherObserver = null;
+    let sourceLookupRequest = 0;
+    let activeSourceLookupRequest = 0;
+    lyrics.style.height = '100%';
+    sourceFetcherHost.style.cssText =
+      'position:fixed;left:-200vw;top:0;width:400px;height:700px;' +
+      'visibility:hidden;opacity:0;pointer-events:none;overflow:hidden;';
+
+    function installNativeStyles() {
+      const root = lyrics.shadowRoot;
+      if (!root || root.querySelector('#native-lyrics-styles')) return;
+
+      const style = document.createElement('style');
+      style.id = 'native-lyrics-styles';
+      style.textContent = `
+        .lyrics-header {
+          display: none !important;
+        }
+        .lyrics-footer,
+        footer {
+          display: none !important;
+        }
+        .lyrics-line,
+        .lyrics-line * {
+          -webkit-tap-highlight-color: transparent !important;
+        }
+        .lyrics-line:focus-visible {
+          outline: none !important;
+        }
+        .lyrics-line:focus-visible::before {
+          opacity: 0 !important;
+          box-shadow: 0 0 0 1px transparent !important;
+          transform: scale(0.98) !important;
+        }
+        .lyrics-syllable .char.native-motion[data-glow]::after {
+          text-shadow: 0 0 var(--am-lyrics-glow-radius, 5px)
+            rgb(255 255 255 / var(--char-glow-max, 0)) !important;
+        }
+      `;
+      root.appendChild(style);
+    }
+
+    function applyTranslationVisibility(visible) {
+      if (visible && !componentHasTranslations(lyrics)) {
+        window.AndroidLyrics?.translationUnavailable();
+        return;
+      }
+      const button = lyrics.shadowRoot?.querySelector(
+        '[aria-label="Toggle translation"]'
+      );
+      if (button && button.getAttribute('aria-pressed') !== String(visible)) {
+        button.click();
+      }
+    }
+
+    function componentHasTranslations(component) {
+      return Array.isArray(component.lyrics) &&
+        component.lyrics.some(line =>
+          typeof line.translation === 'string' && line.translation.trim()
+        );
+    }
+
+    function stopSourceLookup() {
+      sourceFetcherObserver?.disconnect();
+      sourceFetcherObserver = null;
+      sourceFetcher?.remove();
+      sourceFetcher = null;
+    }
+
+    function finishSourceLookupWithoutMatch(requestId) {
+      if (requestId !== activeSourceLookupRequest) return;
+      stopSourceLookup();
+      window.AndroidLyrics?.sourceLookupFailed();
+    }
+
+    function inspectSourceLookup(requestId) {
+      const fetcher = sourceFetcher;
+      if (
+        !fetcher ||
+        requestId !== activeSourceLookupRequest ||
+        fetcher.isLoading
+      ) return;
+
+      const source = fetcher.lyricsSource;
+      if (Array.isArray(fetcher.lyrics) && fetcher.lyrics.length > 0 &&
+          source && source !== 'Local') {
+        const current = fetcher.availableSources?.[fetcher.currentSourceIndex];
+        const ttml = current?.source === source && current.originalTTML
+          ? current.originalTTML
+          : fetcher.generateTTML?.();
+        if (!ttml) {
+          finishSourceLookupWithoutMatch(requestId);
+          return;
+        }
+
+        stopSourceLookup();
+        window.AndroidLyrics?.sourceLookupSucceeded(source, ttml);
+        return;
+      }
+
+      if (fetcher.shadowRoot?.querySelector('.no-lyrics')) {
+        finishSourceLookupWithoutMatch(requestId);
+      }
+    }
+
+    function startSourceLookup(requestId) {
+      if (!nativeState || requestId <= sourceLookupRequest) return;
+      sourceLookupRequest = requestId;
+      activeSourceLookupRequest = requestId;
+      stopSourceLookup();
+
+      const fetcher = document.createElement('am-lyrics');
+      fetcher.style.cssText = 'display:block;width:100%;height:100%;';
+      fetcher.noAutoAlternates = false;
+      fetcher.noBlur = true;
+      fetcher.autoScroll = false;
+      fetcher.interpolate = false;
+      fetcher.songTitle = nativeState.title;
+      fetcher.songArtist = nativeState.artist;
+      fetcher.songAlbum = nativeState.album;
+      fetcher.songDurationMs = nativeState.duration;
+      fetcher.musicId = nativeState.songId;
+      fetcher.query = `${nativeState.title} ${nativeState.artist}`.trim();
+      sourceFetcher = fetcher;
+      sourceFetcherHost.appendChild(fetcher);
+
+      customElements.whenDefined('am-lyrics').then(() => {
+        if (fetcher !== sourceFetcher) return;
+        if (fetcher.shadowRoot) {
+          sourceFetcherObserver = new MutationObserver(() =>
+            inspectSourceLookup(requestId)
+          );
+          sourceFetcherObserver.observe(fetcher.shadowRoot, {
+            childList: true,
+            subtree: true
+          });
+        }
+        fetcher.updateComplete.then(() => inspectSourceLookup(requestId));
+      });
+    }
+
+    window.amLyricsSetContent = (ttml, title, artist, album, duration, color, songId) => {
+      nativeState = {
+        ttml,
+        songId: songId || nativeState?.songId,
+        title,
+        artist,
+        album,
+        duration,
+        color,
+        appearance: nativeState?.appearance || "{}",
+        showTranslations: nativeState?.showTranslations || false
+      };
+      if (!lyrics.isConnected || !customElements.get('am-lyrics')) return;
+
+      installNativeStyles();
+      lyrics.ttml = ttml;
+      lyrics.songTitle = title;
+      lyrics.songArtist = artist;
+      lyrics.songAlbum = album;
+      lyrics.songDurationMs = duration;
+      lyrics.musicId = nativeState.songId;
+      lyrics.highlightColor = color;
+      lyrics.noAutoAlternates = true;
+
+      lyrics.updateComplete.then(() => {
+        installNativeStyles();
+        applyTranslationVisibility(nativeState.showTranslations);
+        window.amLyricsSetAppearance(nativeState.appearance);
+        window.setTimeout(() => {
+          const lyricCount =
+            lyrics.shadowRoot?.querySelectorAll('.lyrics-line:not(.lyrics-gap)').length || 0;
+          if (lyricCount === 0) {
+            console.error('The supplied TTML did not produce visible lyric lines');
+          }
+        }, 500);
+      });
+    };
+
+    window.amLyricsSetTranslations = visible => {
+      if (nativeState) nativeState.showTranslations = Boolean(visible);
+      applyTranslationVisibility(Boolean(visible));
+    };
+
+    window.amLyricsSetAppearance = appearanceJson => {
+      if (nativeState) nativeState.appearance = appearanceJson;
+      const appearance = JSON.parse(appearanceJson);
+      const color = appearance.highlightColor || '#6750A4';
+      const rootStyle = lyrics.style;
+      rootStyle.setProperty('--am-lyrics-highlight-color', color);
+      rootStyle.setProperty('--highlight-color', color);
+      rootStyle.setProperty('--am-lyrics-glow-radius', `${appearance.glowRadius || 0}px`);
+      rootStyle.setProperty('--am-lyrics-compact-font-size', `${appearance.fontSize || 28}px`);
+      rootStyle.setProperty('--am-lyrics-compact-line-spacing', `${appearance.lineSpacing || 18}px`);
+      rootStyle.setProperty('--am-lyrics-highlight-surface', 'transparent');
+      lyrics.highlightColor = color;
+      lyrics.autoScroll = Boolean(appearance.autoScroll);
+      lyrics.interpolate = Boolean(appearance.interpolate);
+      lyrics.noBlur = !appearance.blur;
+      lyrics.reducedMotion = Boolean(appearance.reducedMotion);
+      lyrics.hidePlayedLines = Boolean(appearance.hidePlayedLines);
+    };
+
+    window.amLyricsSetSourceMode = (enabled, requestedId) => {
+      const useExternalSources = Boolean(enabled);
+      const requestId = Number(requestedId) || 0;
+      if (!nativeState) return;
+      if (requestId > sourceLookupRequest) startSourceLookup(requestId);
+      lyrics.dataset.externalSource = String(useExternalSources);
+    };
+
+    window.amLyricsSetTime = (timeMs) => {
+      lyrics.currentTime = Number(timeMs) || 0;
+    };
+
+    lyrics.addEventListener('line-click', event => {
+      if (window.AndroidLyrics) {
+        window.AndroidLyrics.seekTo(Number(event.detail.timestamp) || 0);
+      }
+    });
+
+    customElements.whenDefined('am-lyrics').then(() => {
+      installNativeStyles();
+      if (nativeState) {
+        window.amLyricsSetContent(
+          nativeState.ttml,
+          nativeState.title,
+          nativeState.artist,
+          nativeState.album,
+          nativeState.duration,
+          nativeState.color,
+          nativeState.songId
+        );
+      }
+    });
+  </script>
+</body>
+</html>

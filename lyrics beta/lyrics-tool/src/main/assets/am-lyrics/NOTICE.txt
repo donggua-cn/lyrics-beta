@@ -1,0 +1,8 @@
+The embedded lyrics renderer is based on @uimaxbai/am-lyrics 1.7.4.
+Upstream source: https://github.com/binimum/am-lyrics
+Pinned source commit: 4676f22044bb16a9e548b1f0085b03ad747725c9
+License: Mozilla Public License 2.0 (see LICENSE)
+
+The upstream source checkout is included at android/third_party/am-lyrics.
+The distributed JavaScript bundle is unmodified; index.html is this app's
+integration wrapper.
