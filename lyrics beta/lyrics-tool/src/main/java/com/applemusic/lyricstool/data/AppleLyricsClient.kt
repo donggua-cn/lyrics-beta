@@ -18,13 +18,16 @@ data class SongHit(
     val artist: String,
     val album: String,
     val artworkUrl: String,
-    val durationMs: Long
+    val durationMs: Long,
+    val providerSongId: String? = null,
+    val isrc: String? = null
 )
 
 data class FetchedLyrics(
     val lyrics: Lyrics,
     val ttml: String?,
-    val translationWarning: String? = null
+    val translationWarning: String? = null,
+    val qqQrcDebugText: String? = null
 )
 
 class AppleLyricsClient(context: Context) {
@@ -53,6 +56,10 @@ class AppleLyricsClient(context: Context) {
 
     @Volatile
     var storefront: String = preferences.getString("storefront", "cn") ?: "cn"
+        private set
+
+    @Volatile
+    var lastSearchLocalizationWarning: String? = null
         private set
 
     val isSignedIn: Boolean
@@ -92,13 +99,15 @@ class AppleLyricsClient(context: Context) {
 
     suspend fun searchSongs(term: String): List<SongHit> = withContext(Dispatchers.IO) {
         ensureDeveloperToken()
-        val languages = when (storefront) {
+        lastSearchLocalizationWarning = null
+        val storefrontLanguages = when (storefront) {
             "cn", "zh" -> listOf("zh-Hans-CN", "en-US")
             "jp" -> listOf("ja-JP", "en-US")
             "kr" -> listOf("ko-KR", "en-US")
             "tw", "hk" -> listOf("zh-Hant-TW", "en-US")
             else -> listOf("en-US")
-        }.distinct()
+        }
+        val languages = (listOf("zh-Hans-CN") + storefrontLanguages).distinct()
         val results = LinkedHashMap<String, SongHit>()
         var successfulRequests = 0
         var firstError: Throwable? = null
@@ -130,7 +139,8 @@ class AppleLyricsClient(context: Context) {
                             artist = attributes.optString("artistName", "未知艺人"),
                             album = attributes.optString("albumName"),
                             artworkUrl = artwork,
-                            durationMs = attributes.optLong("durationInMillis")
+                            durationMs = attributes.optLong("durationInMillis"),
+                            isrc = attributes.optString("isrc").takeIf { it.isNotBlank() }
                         )
                     )
                 }
@@ -142,8 +152,147 @@ class AppleLyricsClient(context: Context) {
         if (successfulRequests == 0) {
             throw firstError ?: IllegalStateException("Apple Music 搜索暂时不可用")
         }
-        results.values.toList()
+        localizeSearchResults(term, results.values.toList())
     }
+
+    private suspend fun localizeSearchResults(
+        term: String,
+        songs: List<SongHit>
+    ): List<SongHit> {
+        if (songs.isEmpty() || songs.all { it.hasChineseMetadata() }) return songs
+
+        return try {
+            val encodedTerm = URLEncoder.encode(term, Charsets.UTF_8.name())
+            val response = request(
+                "/v1/catalog/cn/search?term=$encodedTerm&types=songs&limit=50&l=zh-Hans-CN"
+            )
+            val data = JSONObject(response).optJSONObject("results")
+                ?.optJSONObject("songs")?.optJSONArray("data")
+                ?: run {
+                    lastSearchLocalizationWarning =
+                        "国区搜索没有返回本地化曲目信息，当前显示原地区信息"
+                    return songs
+                }
+            val localizedByIsrc = buildMap {
+                for (index in 0 until data.length()) {
+                    val item = data.optJSONObject(index) ?: continue
+                    val attributes = item.optJSONObject("attributes") ?: continue
+                    val isrc = attributes.optString("isrc")
+                        .takeIf { it.isNotBlank() }?.uppercase(Locale.US) ?: continue
+                    val title = attributes.optString("name").takeIf { it.isNotBlank() } ?: continue
+                    val artist = attributes.optString("artistName")
+                        .takeIf { it.isNotBlank() } ?: continue
+                    if (title.none { it.isCjkIdeograph() } &&
+                        artist.none { it.isCjkIdeograph() }
+                    ) continue
+                    put(
+                        isrc,
+                        LocalizedSongMetadata(
+                            title = title,
+                            artist = artist,
+                            album = attributes.optString("albumName")
+                        )
+                    )
+                }
+            }
+            var localizedCount = 0
+            songs.map { song ->
+                val isrc = song.isrc?.uppercase(Locale.US)
+                val localized = isrc?.let(localizedByIsrc::get)
+                    ?: return@map song
+                localizedCount++
+                song.copy(
+                    title = localized.title,
+                    artist = localized.artist,
+                    album = localized.album.ifBlank { song.album }
+                )
+            }.also {
+                val unresolvedCount = songs.count { song ->
+                    !song.hasChineseMetadata() &&
+                        (song.isrc?.uppercase(Locale.US)?.let { it !in localizedByIsrc } ?: true)
+                }
+                if (unresolvedCount > 0) {
+                    lastSearchLocalizationWarning =
+                        if (localizedCount == 0) {
+                            "没有找到对应的国区中文曲目信息，当前显示原地区信息"
+                        } else {
+                            "部分歌曲没有匹配到国区中文信息，仍显示原地区名称"
+                        }
+                }
+            }
+        } catch (error: kotlinx.coroutines.CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            lastSearchLocalizationWarning =
+                "国区中文曲目信息暂时不可用，当前显示原地区信息（${error.message ?: "请求失败"}）"
+            songs
+        }
+    }
+
+    private data class LocalizedSongMetadata(
+        val title: String,
+        val artist: String,
+        val album: String
+    )
+
+    private fun SongHit.hasChineseMetadata(): Boolean =
+        title.any { it.isCjkIdeograph() } && artist.any { it.isCjkIdeograph() }
+
+    suspend fun fetchChineseSongMetadata(song: SongHit): SongHit? = withContext(Dispatchers.IO) {
+        val directLookup = song.id.takeIf { it.isNotBlank() && it.all(Char::isDigit) }?.let { id ->
+            requestOrNull("/v1/catalog/cn/songs/$id?l=zh-Hans-CN")
+                ?.let { localizedSongFromResponse(it, song) }
+        }
+        if (directLookup != null) return@withContext directLookup
+
+        val isrc = song.isrc?.takeIf { it.isNotBlank() } ?: return@withContext null
+        val encodedIsrc = URLEncoder.encode(isrc, Charsets.UTF_8.name())
+        val response = requestOrNull(
+            "/v1/catalog/cn/songs?filter%5Bisrc%5D=$encodedIsrc&l=zh-Hans-CN&limit=5"
+        ) ?: return@withContext null
+        val data = JSONObject(response).optJSONArray("data") ?: return@withContext null
+        val exactTrack = (0 until data.length()).asSequence()
+            .mapNotNull(data::optJSONObject)
+            .firstOrNull { it.optJSONObject("attributes")?.optString("isrc")
+                ?.equals(isrc, ignoreCase = true) == true
+            } ?: return@withContext null
+        localizedSongFromItem(exactTrack, song)
+    }
+
+    private fun localizedSongFromResponse(response: String, original: SongHit): SongHit? {
+        val data = JSONObject(response).optJSONArray("data") ?: return null
+        val matchingId = (0 until data.length())
+            .asSequence()
+            .mapNotNull(data::optJSONObject)
+            .firstOrNull { it.optString("id") == original.id }
+            ?: return null
+        return localizedSongFromItem(matchingId, original)
+    }
+
+    private fun localizedSongFromItem(item: JSONObject, original: SongHit): SongHit? {
+        val attributes = item.optJSONObject("attributes")
+            ?: return null
+        val localizedTitle = attributes.optString("name").takeIf { it.isNotBlank() }
+            ?: return null
+        val localizedArtist = attributes.optString("artistName").takeIf { it.isNotBlank() }
+            ?: return null
+        if (localizedTitle.none { it.isCjkIdeograph() } &&
+            localizedArtist.none { it.isCjkIdeograph() }
+        ) return null
+        return SongHit(
+            id = item.optString("id", original.id),
+            title = localizedTitle,
+            artist = localizedArtist,
+            album = attributes.optString("albumName", original.album),
+            artworkUrl = original.artworkUrl,
+            durationMs = attributes.optLong("durationInMillis", original.durationMs),
+            providerSongId = original.providerSongId,
+            isrc = original.isrc
+        )
+    }
+
+    private fun Char.isCjkIdeograph(): Boolean =
+        code in 0x3400..0x4DBF || code in 0x4E00..0x9FFF || code in 0xF900..0xFAFF
 
     suspend fun fetchLyrics(songId: String): FetchedLyrics? = withContext(Dispatchers.IO) {
         ensureDeveloperToken()

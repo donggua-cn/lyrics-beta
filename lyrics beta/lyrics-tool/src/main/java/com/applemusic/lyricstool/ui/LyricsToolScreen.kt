@@ -152,6 +152,7 @@ import androidx.palette.graphics.Palette
 import kotlinx.coroutines.CancellationException
 import com.applemusic.lyricstool.data.AppleLyricsClient
 import com.applemusic.lyricstool.data.FetchedLyrics
+import com.applemusic.lyricstool.data.QQMusicLyricsClient
 import com.applemusic.lyricstool.data.SongHit
 import org.json.JSONObject
 import com.applemusic.android.apple.AppleLibrarySync
@@ -217,7 +218,8 @@ private val themeColorPresets = listOf(
 private enum class ExportFormat(val extension: String) {
     Text("txt"),
     Lrc("lrc"),
-    Ttml("ttml")
+    Ttml("ttml"),
+    QqQrc("qq-qrc.txt")
 }
 
 private enum class ToolPage {
@@ -238,9 +240,102 @@ private data class LyricsAppearance(
     val hidePlayedLines: Boolean = false
 )
 
+private data class LyricsFetchResult(
+    val lyrics: FetchedLyrics?,
+    val fallbackLyrics: FetchedLyrics? = null,
+    val fallbackSourceName: String? = null,
+    val searchOtherSources: Boolean = false,
+    val notice: String? = null
+)
+
+private suspend fun fetchQqLyricsForAppleSong(
+    appleClient: AppleLyricsClient,
+    qqClient: QQMusicLyricsClient,
+    song: SongHit
+): FetchedLyrics? {
+    var metadataError: Exception? = null
+    val localizedMetadata = try {
+        appleClient.fetchChineseSongMetadata(song)
+    } catch (error: Exception) {
+        metadataError = error
+        null
+    }
+
+    return try {
+        val result = qqClient.fetchMatchingLyrics(
+            title = song.title,
+            artist = song.artist,
+            durationMs = song.durationMs,
+            album = song.album,
+            localizedAliases = listOfNotNull(localizedMetadata)
+        )
+        if (result == null && metadataError != null) throw metadataError
+        result
+    } catch (error: Exception) {
+        metadataError?.takeIf { it !== error }?.let(error::addSuppressed)
+        throw error
+    }
+}
+
+private suspend fun fetchAppleLyricsWithQqFallback(
+    appleClient: AppleLyricsClient,
+    qqClient: QQMusicLyricsClient,
+    song: SongHit
+): LyricsFetchResult {
+    var appleError: Exception? = null
+    val appleLyrics = try {
+        appleClient.fetchLyrics(song.id)
+    } catch (error: Exception) {
+        appleError = error
+        null
+    }
+    if ((appleLyrics?.lyrics?.wordTimedLines() ?: 0) > 0) {
+        return LyricsFetchResult(appleLyrics)
+    }
+
+    var qqError: Exception? = null
+    val qqLyrics = try {
+        fetchQqLyricsForAppleSong(appleClient, qqClient, song)
+    } catch (error: Exception) {
+        qqError = error
+        null
+    }
+    if (qqLyrics != null) {
+        return LyricsFetchResult(
+            lyrics = qqLyrics,
+            fallbackLyrics = appleLyrics,
+            fallbackSourceName = "Apple Music",
+            searchOtherSources = qqLyrics.lyrics.wordTimedLines() == 0,
+            notice = if (qqLyrics.lyrics.wordTimedLines() == 0) {
+                "QQ 音乐也没有逐字时间轴，正在尝试其他歌词来源"
+            } else {
+                "已自动切换到 QQ 音乐逐字歌词"
+            }
+        )
+    }
+    if (appleLyrics != null) {
+        return LyricsFetchResult(
+            lyrics = appleLyrics,
+            searchOtherSources = true,
+            notice = "正在尝试其他歌词来源"
+        )
+    }
+    val error = qqError ?: appleError
+    error?.let { qqError?.takeIf { qq -> qq !== it }?.let(it::addSuppressed) }
+    return LyricsFetchResult(
+        lyrics = null,
+        searchOtherSources = true,
+        notice = error?.message ?: "正在尝试其他歌词来源"
+    )
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun LyricsToolScreen(client: AppleLyricsClient, nowPlayingRequest: Long = 0L) {
+internal fun LyricsToolScreen(
+    client: AppleLyricsClient,
+    qqMusicClient: QQMusicLyricsClient,
+    nowPlayingRequest: Long = 0L
+) {
     val context = LocalContext.current
     val themePreferences = remember(context) {
         context.getSharedPreferences("app_theme", android.content.Context.MODE_PRIVATE)
@@ -283,6 +378,7 @@ internal fun LyricsToolScreen(client: AppleLyricsClient, nowPlayingRequest: Long
         var externalSourceMode by remember { mutableStateOf(false) }
         var externalSourceName by remember { mutableStateOf<String?>(null) }
         var sourceLookupInProgress by remember { mutableStateOf(false) }
+        var sourceLookupRestoreOnFailure by remember { mutableStateOf(false) }
         var sourceLookupRequest by remember { mutableStateOf(0) }
         var externalFallbackLyrics by remember { mutableStateOf<FetchedLyrics?>(null) }
         var externalFallbackSourceName by remember { mutableStateOf<String?>(null) }
@@ -492,6 +588,38 @@ internal fun LyricsToolScreen(client: AppleLyricsClient, nowPlayingRequest: Long
                 ?.let { runCatching { Color(android.graphics.Color.parseColor(it)) }.getOrNull() }
                 ?: MaterialTheme.colorScheme.primary
 
+        fun applyLyricsResult(song: SongHit, result: LyricsFetchResult) {
+            if (selectedSong != song) return
+            fetchedLyrics = result.lyrics
+            externalFallbackLyrics = result.fallbackLyrics
+            externalFallbackSourceName = result.fallbackSourceName
+            externalSourceName = result.fallbackSourceName?.let { "QQ 音乐" }
+            externalSourceMode = result.fallbackSourceName != null
+            LiveLyricsNotification.setLyrics(song.id, result.lyrics?.lyrics)
+            result.notice?.let { lyricsNotice = it }
+            if (result.searchOtherSources) {
+                externalFallbackLyrics = result.lyrics
+                externalFallbackSourceName = if (externalSourceMode) externalSourceName else "Apple Music"
+                sourceLookupRestoreOnFailure = true
+                sourceLookupInProgress = true
+                sourceLookupRequest += 1
+            } else if (result.lyrics == null) {
+                lyricsNotice = "这首歌暂时没有可用歌词"
+            }
+        }
+
+        fun searchOtherSources(automatic: Boolean) {
+            externalFallbackLyrics = fetchedLyrics
+            externalFallbackSourceName =
+                if (externalSourceMode) externalSourceName else "Apple Music"
+            sourceLookupRestoreOnFailure = automatic
+            sourceLookupInProgress = true
+            sourceLookupRequest += 1
+        }
+
+        fun currentLyricSourceName(): String =
+            if (externalSourceMode) externalSourceName ?: "外部来源" else "Apple Music"
+
         fun search() {
             val term = query.trim()
             if (term.isEmpty() || searching) return
@@ -505,6 +633,7 @@ internal fun LyricsToolScreen(client: AppleLyricsClient, nowPlayingRequest: Long
                 try {
                     songs = client.searchSongs(term)
                     if (songs.isEmpty()) snackbar.showSnackbar("没有找到歌曲，试试歌名或艺人名")
+                    client.lastSearchLocalizationWarning?.let { snackbar.showSnackbar(it) }
                 } catch (error: Exception) {
                     snackbar.showSnackbar(error.message ?: "搜索失败，请稍后重试")
                 } finally {
@@ -551,23 +680,19 @@ internal fun LyricsToolScreen(client: AppleLyricsClient, nowPlayingRequest: Long
             playbackStatus = PlaybackEngine.preparingNote
 
             try {
-                client.prepare()
-                val result = client.fetchLyrics(song.id)
-                if (selectedSong?.id == song.id) {
-                    fetchedLyrics = result
-                    externalFallbackLyrics = result
-                    LiveLyricsNotification.setLyrics(song.id, result?.lyrics)
-                    if (result == null) {
-                        lyricsNotice = "这首歌暂时没有可用歌词"
-                    }
-                }
+                val lyricsResult = fetchAppleLyricsWithQqFallback(
+                    client,
+                    qqMusicClient,
+                    song
+                )
+                applyLyricsResult(song, lyricsResult)
             } catch (error: Exception) {
-                if (selectedSong?.id == song.id) {
+                if (selectedSong == song) {
                     val message = error.message ?: "获取歌词失败，请稍后重试"
                     lyricsError = message
                 }
             } finally {
-                if (selectedSong?.id == song.id) loadingLyrics = false
+                if (selectedSong == song) loadingLyrics = false
             }
         }
 
@@ -575,6 +700,7 @@ internal fun LyricsToolScreen(client: AppleLyricsClient, nowPlayingRequest: Long
             externalSourceMode = false
             externalSourceName = null
             sourceLookupInProgress = false
+            sourceLookupRestoreOnFailure = false
             sourceLookupRequest = 0
             lyricsNotice = null
             externalFallbackLyrics = null
@@ -592,12 +718,10 @@ internal fun LyricsToolScreen(client: AppleLyricsClient, nowPlayingRequest: Long
             ) {
                 notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
             }
+            val song = selectedSong ?: return@LaunchedEffect
             while (true) {
                 playbackPositionMs = PlaybackEngine.positionMs()
-                playbackDurationMs = maxOf(
-                    PlaybackEngine.durationMs(),
-                    selectedSong?.durationMs ?: 0L
-                )
+                playbackDurationMs = maxOf(PlaybackEngine.durationMs(), song.durationMs)
                 playbackIsPlaying = PlaybackEngine.isPlaying()
                 playbackStatus = PlaybackEngine.preparingNote
                 delay(100L)
@@ -866,15 +990,12 @@ internal fun LyricsToolScreen(client: AppleLyricsClient, nowPlayingRequest: Long
                                                     lyricsError = null
                                                     scope.launch {
                                                         try {
-                                                            fetchedLyrics = client.fetchLyrics(song.id)
-                                                            externalFallbackLyrics = fetchedLyrics
-                                                            if (fetchedLyrics == null) {
-                                                                lyricsNotice = "这首歌暂时没有可用歌词"
-                                                            } else {
-                                                                fetchedLyrics?.translationWarning?.let {
-                                                                    lyricsNotice = "翻译歌词获取失败：$it"
-                                                                }
-                                                            }
+                                                            val result = fetchAppleLyricsWithQqFallback(
+                                                                client,
+                                                                qqMusicClient,
+                                                                song
+                                                            )
+                                                            applyLyricsResult(song, result)
                                                         } catch (error: Exception) {
                                                             val message = error.message ?: "获取歌词失败，请稍后重试"
                                                             lyricsError = message
@@ -909,21 +1030,97 @@ internal fun LyricsToolScreen(client: AppleLyricsClient, nowPlayingRequest: Long
                                                     )
                                                 },
                                                 onSearchOtherSources = {
+                                                    searchOtherSources(automatic = false)
+                                                },
+                                                onSelectAppleLyrics = {
+                                                    sourceLookupInProgress = false
+                                                    sourceLookupRestoreOnFailure = false
                                                     externalFallbackLyrics = fetchedLyrics
-                                                    externalFallbackSourceName = externalSourceName
-                                                    sourceLookupInProgress = true
-                                                    sourceLookupRequest += 1
+                                                    externalFallbackSourceName = currentLyricSourceName()
+                                                    loadingLyrics = true
+                                                    scope.launch {
+                                                        try {
+                                                            val result = client.fetchLyrics(song.id)
+                                                            fetchedLyrics = result
+                                                            externalSourceMode = false
+                                                            externalSourceName = null
+                                                            LiveLyricsNotification.setLyrics(
+                                                                song.id,
+                                                                result?.lyrics
+                                                            )
+                                                            lyricsNotice = if (result == null) {
+                                                                "Apple Music 没有提供这首歌的歌词"
+                                                            } else {
+                                                                "已切换到 Apple Music 歌词"
+                                                            }
+                                                        } catch (error: Exception) {
+                                                            lyricsNotice =
+                                                                error.message ?: "获取 Apple Music 歌词失败"
+                                                        } finally {
+                                                            loadingLyrics = false
+                                                        }
+                                                    }
+                                                },
+                                                onSelectQqLyrics = {
+                                                    sourceLookupInProgress = false
+                                                    sourceLookupRestoreOnFailure = false
+                                                    externalFallbackLyrics = fetchedLyrics
+                                                    externalFallbackSourceName = currentLyricSourceName()
+                                                    loadingLyrics = true
+                                                    scope.launch {
+                                                        try {
+                                                            val result = fetchQqLyricsForAppleSong(
+                                                                client,
+                                                                qqMusicClient,
+                                                                song
+                                                            )
+                                                            if (result == null) {
+                                                                lyricsNotice =
+                                                                    "QQ 音乐没有找到匹配的歌词"
+                                                            } else {
+                                                                fetchedLyrics = result
+                                                                externalSourceMode = true
+                                                                externalSourceName = "QQ 音乐"
+                                                                LiveLyricsNotification.setLyrics(
+                                                                    song.id,
+                                                                    result.lyrics
+                                                                )
+                                                                lyricsNotice = if (
+                                                                    result.lyrics.wordTimedLines() > 0
+                                                                ) {
+                                                                    "已切换到 QQ 音乐逐字歌词"
+                                                                } else {
+                                                                    "QQ 音乐只提供逐行歌词，没有找到这首歌的逐字 QRC 版本"
+                                                                }
+                                                            }
+                                                        } catch (error: Exception) {
+                                                            lyricsNotice =
+                                                                error.message ?: "获取 QQ 音乐歌词失败"
+                                                        } finally {
+                                                            loadingLyrics = false
+                                                        }
+                                                    }
                                                 },
                                                 onRestoreAppleLyrics = {
+                                                    sourceLookupInProgress = false
+                                                    sourceLookupRestoreOnFailure = false
                                                     externalFallbackLyrics?.let { fetchedLyrics = it }
                                                     externalSourceName = externalFallbackSourceName
-                                                    externalSourceMode = externalFallbackSourceName != null
+                                                    externalSourceMode =
+                                                        externalFallbackSourceName != null &&
+                                                            externalFallbackSourceName != "Apple Music"
+                                                    externalFallbackLyrics?.let {
+                                                        LiveLyricsNotification.setLyrics(
+                                                            song.id,
+                                                            it.lyrics
+                                                        )
+                                                    }
                                                     externalFallbackLyrics = null
                                                     externalFallbackSourceName = null
                                                 },
                                                 onOpenAppearance = { lyricsAppearanceOpen = true },
                                                 onSourceLookupSucceeded = { source, ttml ->
-                                                    if (selectedSong?.id == song.id) {
+                                                    if (selectedSong == song && sourceLookupInProgress) {
                                                         val parsed = LyricsParser.parseTtml(
                                                             ttml,
                                                             "external-source"
@@ -934,19 +1131,41 @@ internal fun LyricsToolScreen(client: AppleLyricsClient, nowPlayingRequest: Long
                                                                 "$source 返回的歌词格式无法识别，继续使用当前歌词"
                                                         } else {
                                                             fetchedLyrics = FetchedLyrics(parsed, ttml)
-                                                            LiveLyricsNotification.setLyrics(song.id, parsed)
+                                                            LiveLyricsNotification.setLyrics(
+                                                                song.id,
+                                                                parsed
+                                                            )
                                                             externalSourceMode = true
                                                             externalSourceName = source
                                                             sourceLookupInProgress = false
+                                                            sourceLookupRestoreOnFailure = false
                                                             lyricsNotice = "已从 $source 找到歌词"
                                                         }
                                                     }
                                                 },
                                                 onSourceLookupFailed = {
-                                                    if (selectedSong?.id == song.id) {
+                                                    if (selectedSong == song && sourceLookupInProgress) {
                                                         sourceLookupInProgress = false
-                                                        lyricsNotice =
-                                                            "其他来源没有匹配到歌词，继续使用当前歌词"
+                                                        if (sourceLookupRestoreOnFailure) {
+                                                            externalFallbackLyrics?.let {
+                                                                fetchedLyrics = it
+                                                                LiveLyricsNotification.setLyrics(
+                                                                    song.id,
+                                                                    it.lyrics
+                                                                )
+                                                            }
+                                                            externalSourceName =
+                                                                externalFallbackSourceName
+                                                            externalSourceMode =
+                                                                externalFallbackSourceName != null &&
+                                                                    externalFallbackSourceName != "Apple Music"
+                                                            sourceLookupRestoreOnFailure = false
+                                                            lyricsNotice =
+                                                                "其他来源没有匹配到歌词，继续使用${externalSourceName ?: "Apple Music"}歌词"
+                                                        } else {
+                                                            lyricsNotice =
+                                                                "其他来源没有匹配到歌词，继续使用当前歌词"
+                                                        }
                                                     }
                                                 },
                                                 onTranslationUnavailable = {
@@ -992,25 +1211,44 @@ internal fun LyricsToolScreen(client: AppleLyricsClient, nowPlayingRequest: Long
                                             }
                                             scope.launch {
                                                 try {
-                                                    val result = client.fetchLyrics(song.id)
-                                                    if (selectedSong?.id == song.id) {
-                                                        fetchedLyrics = result
-                                                        LiveLyricsNotification.setLyrics(song.id, result?.lyrics)
+                                                    val lyricsResult = fetchAppleLyricsWithQqFallback(
+                                                        client,
+                                                        qqMusicClient,
+                                                        song
+                                                    )
+                                                    if (selectedSong == song) {
+                                                        fetchedLyrics = lyricsResult.lyrics
+                                                        externalFallbackLyrics =
+                                                            lyricsResult.fallbackLyrics
+                                                        externalFallbackSourceName =
+                                                            lyricsResult.fallbackSourceName
+                                                        externalSourceName =
+                                                            lyricsResult.fallbackSourceName?.let {
+                                                                "QQ 音乐"
+                                                            }
+                                                        externalSourceMode =
+                                                            lyricsResult.fallbackSourceName != null
+                                                        LiveLyricsNotification.setLyrics(
+                                                            song.id,
+                                                            lyricsResult.lyrics?.lyrics
+                                                        )
                                                     }
-                                                    if (result == null && selectedSong?.id == song.id) {
+                                                    if (lyricsResult.lyrics == null &&
+                                                        selectedSong == song
+                                                    ) {
                                                         lyricsNotice = "这首歌暂时没有可用歌词"
-                                                    } else if (selectedSong?.id == song.id) {
-                                                        result?.translationWarning?.let {
+                                                    } else if (selectedSong == song) {
+                                                        lyricsResult.lyrics?.translationWarning?.let {
                                                             lyricsNotice = "翻译歌词获取失败：$it"
                                                         }
                                                     }
                                                 } catch (error: Exception) {
                                                     val message = error.message ?: "获取歌词失败，请稍后重试"
-                                                    if (selectedSong?.id == song.id) {
+                                                    if (selectedSong == song) {
                                                         lyricsError = message
                                                     }
                                                 } finally {
-                                                    if (selectedSong?.id == song.id) loadingLyrics = false
+                                                    if (selectedSong == song) loadingLyrics = false
                                                 }
                                             }
                                         }
@@ -1205,6 +1443,8 @@ private fun LyricsDetail(
     onExport: (ExportFormat) -> Unit,
     onImportLyrics: () -> Unit,
     onSearchOtherSources: () -> Unit,
+    onSelectAppleLyrics: () -> Unit,
+    onSelectQqLyrics: () -> Unit,
     onRestoreAppleLyrics: () -> Unit,
     onOpenAppearance: () -> Unit,
     onSourceLookupSucceeded: (String, String) -> Unit,
@@ -1214,8 +1454,18 @@ private fun LyricsDetail(
     var exportMenuExpanded by remember { mutableStateOf(false) }
     var actionsMenuExpanded by remember { mutableStateOf(false) }
     var dragPositionMs by remember(song.id) { mutableStateOf<Long?>(null) }
-    var showTranslations by remember(song.id) { mutableStateOf(false) }
+    val hasTranslations = fetchedLyrics?.lyrics?.lines
+        ?.any { !it.translation.isNullOrBlank() } == true
+    var showTranslations by remember(song.id, externalSourceName, fetchedLyrics) {
+        mutableStateOf(
+            externalSourceMode &&
+                externalSourceName == "QQ 音乐" &&
+                hasTranslations
+        )
+    }
     val displayPositionMs = dragPositionMs ?: positionMs
+    val lyricSourceName = if (externalSourceMode) externalSourceName ?: "外部来源"
+    else "Apple Music"
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -1238,11 +1488,7 @@ private fun LyricsDetail(
                     IconButton(onClick = onCopy) {
                         Icon(
                             Icons.Filled.ContentCopy,
-                            contentDescription = if (externalSourceMode) {
-                                "复制${externalSourceName ?: "外部"}歌词"
-                            } else {
-                                "复制 Apple Music 歌词"
-                            },
+                            contentDescription = "复制 $lyricSourceName 歌词",
                             modifier = Modifier.size(22.dp)
                         )
                     }
@@ -1257,11 +1503,7 @@ private fun LyricsDetail(
                             DropdownMenuItem(
                                 text = {
                                     Text(
-                                        if (externalSourceMode) {
-                                            "下载 ${externalSourceName ?: "外部来源"} TXT"
-                                        } else {
-                                            "下载 Apple Music TXT"
-                                        }
+                                        "下载 $lyricSourceName TXT"
                                     )
                                 },
                                 onClick = {
@@ -1273,11 +1515,7 @@ private fun LyricsDetail(
                                 text = {
                                     Text(
                                         if (fetchedLyrics.lyrics.synced) {
-                                            if (externalSourceMode) {
-                                                "下载 ${externalSourceName ?: "外部来源"} LRC 时间轴"
-                                            } else {
-                                                "下载 Apple Music LRC 时间轴"
-                                            }
+                                            "下载 $lyricSourceName LRC 时间轴"
                                         }
                                         else "LRC 时间轴不可用（无同步时间）"
                                     )
@@ -1292,11 +1530,7 @@ private fun LyricsDetail(
                                 text = {
                                     Text(
                                         if (fetchedLyrics.ttml == null) "TTML 暂不可用"
-                                        else if (externalSourceMode) {
-                                            "下载 ${externalSourceName ?: "外部来源"} TTML"
-                                        } else {
-                                            "下载 Apple Music TTML 逐字时间轴"
-                                        }
+                                        else "下载 $lyricSourceName TTML 逐字时间轴"
                                     )
                                 },
                                 enabled = fetchedLyrics.ttml != null,
@@ -1305,6 +1539,15 @@ private fun LyricsDetail(
                                     onExport(ExportFormat.Ttml)
                                 }
                             )
+                            if (fetchedLyrics.qqQrcDebugText != null) {
+                                DropdownMenuItem(
+                                    text = { Text("下载 QQ QRC 解密结构（供排查）") },
+                                    onClick = {
+                                        exportMenuExpanded = false
+                                        onExport(ExportFormat.QqQrc)
+                                    }
+                                )
+                            }
                         }
                     }
                 }
@@ -1316,12 +1559,13 @@ private fun LyricsDetail(
                         expanded = actionsMenuExpanded,
                         onDismissRequest = { actionsMenuExpanded = false }
                     ) {
-                        if (externalSourceMode) {
+                        if (
+                            externalFallbackSourceName != null &&
+                            externalFallbackSourceName != lyricSourceName
+                        ) {
                             DropdownMenuItem(
                                 text = {
-                                    Text(
-                                        "返回 ${externalFallbackSourceName ?: "Apple Music"} 歌词"
-                                    )
+                                    Text("返回 $externalFallbackSourceName 歌词")
                                 },
                                 onClick = {
                                     actionsMenuExpanded = false
@@ -1330,7 +1574,51 @@ private fun LyricsDetail(
                             )
                         }
                         DropdownMenuItem(
-                            text = { Text("从其他在线来源查找") },
+                            text = {
+                                Text(
+                                    if (!externalSourceMode) {
+                                        "Apple Music 歌词（当前）"
+                                    } else {
+                                        "使用 Apple Music 歌词"
+                                    }
+                                )
+                            },
+                            enabled = externalSourceMode || !loading,
+                            onClick = {
+                                actionsMenuExpanded = false
+                                onSelectAppleLyrics()
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = {
+                                Text(
+                                    if (externalSourceMode && externalSourceName == "QQ 音乐") {
+                                        "QQ 音乐歌词（当前）"
+                                    } else {
+                                        "使用 QQ 音乐歌词"
+                                    }
+                                )
+                            },
+                            enabled = !(externalSourceMode && externalSourceName == "QQ 音乐") &&
+                                !loading,
+                            onClick = {
+                                actionsMenuExpanded = false
+                                onSelectQqLyrics()
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = {
+                                Text(
+                                    if (externalSourceMode &&
+                                        externalSourceName != "QQ 音乐"
+                                    ) {
+                                        "其他在线来源（当前：$lyricSourceName）"
+                                    } else {
+                                        "从其他在线来源查找"
+                                    }
+                                )
+                            },
+                            enabled = !sourceLookupInProgress && !loading,
                             onClick = {
                                 actionsMenuExpanded = false
                                 onSearchOtherSources()
@@ -1370,8 +1658,6 @@ private fun LyricsDetail(
             onToggleFullscreen = onToggleFullscreen,
             showTranslations = showTranslations,
             onToggleTranslations = {
-                val hasTranslations = fetchedLyrics?.lyrics?.lines
-                    ?.any { !it.translation.isNullOrBlank() } == true
                 if (!showTranslations && !hasTranslations) {
                     onTranslationUnavailable()
                 } else {
@@ -1487,7 +1773,7 @@ private fun LyricsDetail(
 
             else -> EmptyLyrics(
                 title = "这首歌暂时没有歌词",
-                detail = "Apple Music 可能尚未提供这首歌的歌词。",
+                detail = "$lyricSourceName 可能尚未提供这首歌的歌词。",
                 action = null,
                 onAction = {}
             )
@@ -2834,6 +3120,7 @@ private fun formatPlaybackTime(ms: Long): String {
 }
 
 private fun ExportFormat.render(fetched: FetchedLyrics?): String {
+    if (this == ExportFormat.QqQrc) return fetched?.qqQrcDebugText.orEmpty()
     val lyrics = fetched?.lyrics ?: return ""
     return when (this) {
         ExportFormat.Text -> lyrics.lines.renderWithTranslations()
@@ -2845,6 +3132,7 @@ private fun ExportFormat.render(fetched: FetchedLyrics?): String {
                 ?: "$timestamp${line.text}"
         }
         ExportFormat.Ttml -> fetched.ttml ?: lyrics.lines.joinToString("\n") { it.text }
+        ExportFormat.QqQrc -> error("Handled before rendering lyrics")
     }
 }
 

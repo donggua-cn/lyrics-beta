@@ -11,12 +11,14 @@ import com.applemusic.android.player.MusicService
 import com.applemusic.android.player.PlaybackEngine
 import com.applemusic.android.util.Logx
 import com.applemusic.lyricstool.data.AppleLyricsClient
+import com.applemusic.lyricstool.data.QQMusicLyricsClient
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
 
 class LyricsToolActivity : ComponentActivity() {
     private val lyricsClient by lazy { AppleLyricsClient(applicationContext) }
+    private val qqMusicLyricsClient by lazy { QQMusicLyricsClient() }
     private var nowPlayingRequest by mutableLongStateOf(0L)
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -33,7 +35,7 @@ class LyricsToolActivity : ComponentActivity() {
         LiveLyricsNotification.start(applicationContext)
         recordNowPlayingRequest(intent)
         setContent {
-            LyricsToolScreen(lyricsClient, nowPlayingRequest)
+            LyricsToolScreen(lyricsClient, qqMusicLyricsClient, nowPlayingRequest)
         }
     }
 

@@ -140,9 +140,7 @@ object PlaybackEngine {
 
         // ═══════════════ 音频焦点（必须） ═══════════════
         //
-        // 【踩坑】以前只在 MediaPlayer 兜底路径上设过 AudioAttributes，
-        // **ExoPlayer 一次都没设** —— 而 ExoPlayer 只有在你调用 setAudioAttributes
-        // 且 handleAudioFocus=true 时才会去申请音频焦点。后果：
+        // ExoPlayer 只有在设置 AudioAttributes 并启用音频焦点处理后才会申请焦点。
         //   1. 别的 app 在放歌时我们照放，两路声音打架；
         //   2. 系统不认为我们是「当前媒体播放器」，
         //      音量面板 / 媒体卡片显示的是**别的 app**（真机上看到的是 com.luna.music）；
@@ -190,15 +188,6 @@ object PlaybackEngine {
                     "  上下文：uri=${currentUri()} title=${currentSong()?.title ?: "?"} " +
                             "duration=${player?.duration} position=${player?.currentPosition}"
                 )
-                // 只要不是解码器/DRM 类错误，都用系统 MediaPlayer 兜底再试一次。
-                // 它走的是完全不同的解复用路径，能立刻判断「是 ExoPlayer 挑剔还是文件真有问题」。
-                if (fallbackWithMediaPlayer()) {
-                    Logx.i(TAG, "已切换到系统 MediaPlayer 兜底播放")
-                    preparing = false
-                    preparingNote = "（系统播放器）"
-                    onStateChanged?.invoke()
-                    return
-                }
                 preparing = false
                 preparingNote = "播放失败：${error.errorCodeName}"
                 onStateChanged?.invoke()
@@ -356,13 +345,6 @@ object PlaybackEngine {
     }
 
     fun isPlaying(): Boolean {
-        fallback?.let {
-            return try {
-                it.isPlaying
-            } catch (_: Throwable) {
-                false
-            }
-        }
         return player?.isPlaying == true
     }
 
@@ -437,14 +419,6 @@ object PlaybackEngine {
     }
 
     fun toggle() {
-        fallback?.let {
-            try {
-                if (it.isPlaying) it.pause() else it.start()
-                onStateChanged?.invoke()
-                return
-            } catch (_: Throwable) {
-            }
-        }
         val p = player ?: return
         if (p.isPlaying) p.pause() else p.play()
         onStateChanged?.invoke()
@@ -460,36 +434,16 @@ object PlaybackEngine {
         Logx.i(
             TAG,
             "seekTo($ms) 之前 pos=$before duration=$dur " +
-                    "seekable=${p?.isCurrentMediaItemSeekable} fallback=${fallback != null}"
+                    "seekable=${p?.isCurrentMediaItemSeekable}"
         )
-        try {
-            fallback?.seekTo(ms.toInt())
-        } catch (_: Throwable) {
-        }
         p?.seekTo(ms)
         Logx.i(TAG, "seekTo 之后 requested=$ms actual=${p?.currentPosition} state=${p?.playbackState}")
         onStateChanged?.invoke()
     }
 
-    fun positionMs(): Long {
-        fallback?.let {
-            return try {
-                it.currentPosition.toLong()
-            } catch (_: Throwable) {
-                0L
-            }
-        }
-        return player?.currentPosition ?: 0
-    }
+    fun positionMs(): Long = player?.currentPosition ?: 0
 
     fun durationMs(): Long {
-        fallback?.let {
-            return try {
-                it.duration.toLong()
-            } catch (_: Throwable) {
-                0L
-            }
-        }
         val d = player?.duration ?: 0
         if (d > 0) return d
         return currentSong()?.durationMs ?: 0
@@ -620,97 +574,7 @@ object PlaybackEngine {
         onStateChanged?.invoke()
     }
 
-    /** 用系统 MediaPlayer 播放一个本地文件。 */
-    private fun startWithMediaPlayer(path: String) {
-        fallback?.release()
-        val mp = android.media.MediaPlayer()
-        mp.setAudioAttributes(
-            android.media.AudioAttributes.Builder()
-                .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
-                .setContentType(android.media.AudioAttributes.CONTENT_TYPE_MUSIC)
-                .build()
-        )
-        mp.setDataSource(path)
-        mp.setOnPreparedListener {
-            it.start()
-            Logx.i(TAG, "MediaPlayer 已开始播放：$path duration=${it.duration}")
-            onStateChanged?.invoke()
-        }
-        mp.setOnCompletionListener { next() }
-        mp.setOnErrorListener { _, what, extra ->
-            Logx.e(TAG, "MediaPlayer 错误：what=$what extra=$extra")
-            preparingNote = "播放失败（系统播放器 $what/$extra）"
-            onStateChanged?.invoke()
-            true
-        }
-        mp.prepareAsync()
-        fallback = mp
-    }
-
     private const val AppleCacheMin = 1L
-
-    // ─────────────────── 系统 MediaPlayer 兜底 ───────────────────
-
-    private var fallback: android.media.MediaPlayer? = null
-
-    /**
-     * ExoPlayer 解不开文件时，改用系统 MediaPlayer 再试一次。
-     *
-     * 两者用的是不同的解复用实现：ExoPlayer 是自己的 `FragmentedMp4Extractor`，
-     * MediaPlayer 走平台 `MediaExtractor`。真机上遇到过「文件结构完全合法、
-     * ExoPlayer 却报 EOF 越界」的情况，所以保留这条兜底路径。
-     *
-     * @return true 表示已接管播放
-     */
-    private fun fallbackWithMediaPlayer(): Boolean {
-        val uri = currentUri()
-        if (uri == null) {
-            Logx.w(TAG, "兜底中止：currentUri 为空")
-            return false
-        }
-        val song = MusicRepository.findSong(uri)
-        if (song == null) {
-            Logx.w(TAG, "兜底中止：找不到歌曲 $uri")
-            return false
-        }
-        val rawId = if (song.appleId.isNotEmpty()) song.appleId else uri.removePrefix("apple:")
-        val path = MusicRepository.cache.getCachedPath(rawId)
-        if (path == null) {
-            Logx.w(TAG, "兜底中止：缓存未命中 $rawId")
-            return false
-        }
-        return try {
-            player?.pause()
-            fallback?.release()
-            val mp = android.media.MediaPlayer()
-            mp.setAudioAttributes(
-                android.media.AudioAttributes.Builder()
-                    .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
-                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_MUSIC)
-                    .build()
-            )
-            mp.setDataSource(path)
-            mp.setOnErrorListener { _, what, extra ->
-                Logx.e(TAG, "MediaPlayer 也失败：what=$what extra=$extra")
-                preparingNote = "播放失败（系统播放器 $what/$extra）"
-                onStateChanged?.invoke()
-                true
-            }
-            mp.setOnPreparedListener {
-                it.start()
-                Logx.i(TAG, "MediaPlayer 开始播放：$path duration=${it.duration}")
-                onStateChanged?.invoke()
-            }
-            mp.setOnCompletionListener { next() }
-            mp.prepareAsync()
-            fallback = mp
-            Logx.i(TAG, "MediaPlayer prepareAsync 已提交：$path")
-            true
-        } catch (t: Throwable) {
-            Logx.e(TAG, "MediaPlayer 兜底失败：${t.message}", t)
-            false
-        }
-    }
 
     fun release() {
         // 先释放会话再释放播放器：顺序反了会在系统侧留下一个指向已释放播放器的会话
@@ -724,11 +588,6 @@ object PlaybackEngine {
         } catch (_: Throwable) {
         }
         mediaSession = null
-        try {
-            fallback?.release()
-        } catch (_: Throwable) {
-        }
-        fallback = null
         player?.release()
         player = null
     }

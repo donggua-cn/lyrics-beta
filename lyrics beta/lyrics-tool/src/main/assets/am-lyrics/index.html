@@ -83,6 +83,12 @@
       root.appendChild(style);
     }
 
+    function disableHiddenFooterScroll() {
+      if (!lyrics.shadowRoot) return;
+      lyrics.footerElement = null;
+      lyrics.shadowRoot.querySelector('.lyrics-footer')?.classList.remove('active');
+    }
+
     function applyTranslationVisibility(visible) {
       if (visible && !componentHasTranslations(lyrics)) {
         window.AndroidLyrics?.translationUnavailable();
@@ -208,6 +214,7 @@
 
       lyrics.updateComplete.then(() => {
         installNativeStyles();
+        disableHiddenFooterScroll();
         applyTranslationVisibility(nativeState.showTranslations);
         window.amLyricsSetAppearance(nativeState.appearance);
         window.setTimeout(() => {
@@ -223,6 +230,7 @@
     window.amLyricsSetTranslations = visible => {
       if (nativeState) nativeState.showTranslations = Boolean(visible);
       applyTranslationVisibility(Boolean(visible));
+      disableHiddenFooterScroll();
     };
 
     window.amLyricsSetAppearance = appearanceJson => {
