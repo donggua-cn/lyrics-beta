@@ -38,8 +38,20 @@
   <div id="lyrics-source-fetcher" aria-hidden="true"></div>
   <script>
     const lyrics = document.querySelector('am-lyrics');
+    const initialAppearanceParams = new URLSearchParams(window.location.search);
+    const initialHighlightColor = initialAppearanceParams.get('highlightColor') || '#6750A4';
+    const initialDarkTheme = initialAppearanceParams.get('darkTheme') === 'true';
+    const initialLyricColor = initialDarkTheme
+      ? darkModeContrastColor(initialHighlightColor)
+      : initialHighlightColor;
+    lyrics.setAttribute('highlight-color', initialLyricColor);
+    lyrics.style.setProperty('--am-lyrics-highlight-color', initialLyricColor);
+    lyrics.style.setProperty('--highlight-color', initialLyricColor);
+    lyrics.style.setProperty('--lyplus-lyrics-palette', initialLyricColor);
+    lyrics.style.setProperty('--lyplus-text-primary', initialLyricColor);
     const sourceFetcherHost = document.getElementById('lyrics-source-fetcher');
     let nativeState = null;
+    let nativeAppearance = "{}";
     let sourceFetcher = null;
     let sourceFetcherObserver = null;
     let sourceLookupRequest = 0;
@@ -47,6 +59,7 @@
     let nativeBlurObserver = null;
     const nativeEffectLines = new Set();
     lyrics.style.height = '100%';
+    lyrics.style.visibility = 'hidden';
     sourceFetcherHost.style.cssText =
       'position:fixed;left:-200vw;top:0;width:400px;height:700px;' +
       'visibility:hidden;opacity:0;pointer-events:none;overflow:hidden;';
@@ -326,28 +339,35 @@
         album,
         duration,
         color,
-        darkTheme: Boolean(nativeState?.darkTheme),
-        appearance: nativeState?.appearance || "{}",
+        darkTheme: nativeState?.darkTheme ?? initialDarkTheme,
+        appearance: nativeAppearance,
         showTranslations: nativeState?.showTranslations || false
       };
       if (!lyrics.isConnected || !customElements.get('am-lyrics')) return;
 
       installNativeStyles();
       observeInactiveLineEffects();
+      window.amLyricsSetAppearance(nativeState.appearance);
       lyrics.ttml = ttml;
       lyrics.songTitle = title;
       lyrics.songArtist = artist;
       lyrics.songAlbum = album;
       lyrics.songDurationMs = duration;
       lyrics.musicId = nativeState.songId;
-      lyrics.highlightColor = color;
+      lyrics.highlightColor = nativeState.darkTheme
+        ? darkModeContrastColor(color)
+        : color;
       lyrics.noAutoAlternates = true;
 
-      lyrics.updateComplete.then(() => {
+      lyrics.updateComplete.then(async () => {
         installNativeStyles();
         disableHiddenFooterScroll();
         applyTranslationVisibility(nativeState.showTranslations);
-        window.amLyricsSetAppearance(nativeState.appearance);
+        await window.amLyricsSetAppearance(nativeState.appearance);
+        await lyrics.updateComplete;
+        requestAnimationFrame(() => {
+          lyrics.style.visibility = 'visible';
+        });
         window.setTimeout(() => {
           const lyricCount =
             lyrics.shadowRoot?.querySelectorAll('.lyrics-line:not(.lyrics-gap)').length || 0;
@@ -365,8 +385,13 @@
     };
 
     window.amLyricsSetAppearance = appearanceJson => {
+      nativeAppearance = appearanceJson;
+      const previousLinePosition = nativeState
+        ? JSON.parse(nativeState.appearance || '{}').currentLinePosition ?? 18
+        : 18;
       if (nativeState) nativeState.appearance = appearanceJson;
       const appearance = JSON.parse(appearanceJson);
+      const currentLinePosition = appearance.currentLinePosition ?? 18;
       const color = appearance.highlightColor || '#6750A4';
       const lyricColor = appearance.darkTheme ? darkModeContrastColor(color) : color;
       const rootStyle = lyrics.style;
@@ -385,7 +410,52 @@
       rootStyle.setProperty('--am-lyrics-glow-radius', `${appearance.glowRadius || 0}px`);
       rootStyle.setProperty('--am-lyrics-compact-font-size', `${appearance.fontSize || 28}px`);
       rootStyle.setProperty('--am-lyrics-compact-line-spacing', `${appearance.lineSpacing || 18}px`);
+      rootStyle.setProperty('--lyrics-scroll-padding-top', `${currentLinePosition}%`);
+      const lyricsContainer = lyrics.shadowRoot?.querySelector('.lyrics-container');
+      lyricsContainer?.style.setProperty(
+        '--lyrics-scroll-padding-top',
+        `${currentLinePosition}%`
+      );
+      if (
+        lyricsContainer &&
+        Number(currentLinePosition) !== Number(previousLinePosition)
+      ) {
+        const activeLine =
+          lyrics.currentPrimaryActiveLine ||
+          lyricsContainer.querySelector('.lyrics-line.active:not(.lyrics-gap)');
+        if (activeLine) {
+          lyrics.setUserScrolling(false);
+          lyrics.isProgrammaticScroll = true;
+          lyricsContainer.scrollTo({
+            top: Math.max(0, activeLine.offsetTop - lyrics.getScrollPaddingTop()),
+            behavior: 'instant'
+          });
+          requestAnimationFrame(() => {
+            lyrics.isProgrammaticScroll = false;
+          });
+        }
+      }
       rootStyle.setProperty('--am-lyrics-highlight-surface', 'transparent');
+      const fontFileName = appearance.customFontFileName;
+      const fontStyleId = 'user-lyrics-font';
+      let fontStyle = document.getElementById(fontStyleId);
+      if (fontFileName && /^lyrics-[a-f0-9-]+\.(ttf|otf)$/.test(fontFileName)) {
+        if (!fontStyle) {
+          fontStyle = document.createElement('style');
+          fontStyle.id = fontStyleId;
+          document.head.appendChild(fontStyle);
+        }
+        const format = fontFileName.endsWith('.otf') ? 'opentype' : 'truetype';
+        fontStyle.textContent =
+          `@font-face{font-family:"LyricsUserFont";src:url(` +
+          `"https://appassets.androidplatform.net/custom-font/${fontFileName}"` +
+          `) format("${format}");font-display:swap;}`;
+        lyrics.fontFamily = '"LyricsUserFont"';
+      } else {
+        fontStyle?.remove();
+        lyrics.fontFamily = '';
+        lyrics.style.removeProperty('font-family');
+      }
       lyrics.highlightColor = lyricColor;
       if (nativeState) nativeState.darkTheme = Boolean(appearance.darkTheme);
       lyrics.autoScroll = Boolean(appearance.autoScroll);
@@ -394,6 +464,7 @@
       lyrics.reducedMotion = Boolean(appearance.reducedMotion);
       lyrics.hidePlayedLines = Boolean(appearance.hidePlayedLines);
       scheduleInactiveLineEffects();
+      return lyrics.updateComplete;
     };
 
     window.amLyricsSetSourceMode = (enabled, requestedId) => {

@@ -26,6 +26,12 @@ class AppleApi(private val prefs: TokenStore) {
         private const val UA = AppleConst.UA
     }
 
+    data class StationProbeResponse(
+        val path: String,
+        val statusCode: Int,
+        val body: String
+    )
+
     @Volatile
     var devToken: String = ""
         private set
@@ -179,6 +185,68 @@ class AppleApi(private val prefs: TokenStore) {
         return parseSongs(ampGet(path), true)
     }
 
+    fun favoritePlaylistId(): String = prefs.getString("favorite_playlist_id", "")
+
+    fun setFavoritePlaylistId(playlistId: String) {
+        require(playlistId.matches(Regex("[A-Za-z0-9._-]+"))) { "无效的歌单 ID" }
+        prefs.putString("favorite_playlist_id", playlistId)
+    }
+
+    /** 获取已验证的 Apple 喜爱歌曲歌单中的目录歌曲 ID。 */
+    fun getFavoriteCatalogSongIds(): Set<String> {
+        val configuredPlaylistId = favoritePlaylistId()
+        val favoritePlaylistNames = setOf(
+            "favorite songs",
+            "喜爱歌曲",
+            "喜爱的歌曲",
+            "喜欢的歌曲",
+            "喜欢的音乐",
+            "喜爱的音乐",
+            "最爱歌曲",
+            "最爱音乐",
+            "最喜欢的歌曲",
+            "最喜欢的音乐"
+        )
+        val favoritePlaylist = if (configuredPlaylistId.isNotBlank()) {
+            ApplePlaylist(id = configuredPlaylistId)
+        } else {
+            val playlists = ArrayList<ApplePlaylist>()
+            var offset = 0
+            var playlistPage = getLibraryPlaylists(100, offset)
+            var guard = 0
+            while (playlistPage.items.isNotEmpty() && guard < 50) {
+                playlists.addAll(playlistPage.items)
+                offset += playlistPage.items.size
+                if (playlistPage.items.size < 100) break
+                playlistPage = getLibraryPlaylists(100, offset)
+                guard++
+            }
+            playlists.firstOrNull {
+                it.name.trim().lowercase() in favoritePlaylistNames
+            } ?: throw IllegalStateException(
+                "Apple Music 资料库中未找到喜爱歌曲歌单；请在歌单诊断页指定已验证的歌单"
+            )
+        }
+
+        val songIds = LinkedHashSet<String>()
+        val seenPageSignatures = HashSet<String>()
+        var offset = 0
+        var songPage = getPlaylistTracks(favoritePlaylist.id, 100, offset)
+        var guard = 0
+        while (songPage.items.isNotEmpty() && guard < 100) {
+            val pageIds = songPage.items.map { song ->
+                song.catalogId.ifBlank { song.id.takeUnless { it.startsWith("i.") }.orEmpty() }
+            }.filter(String::isNotBlank)
+            if (!seenPageSignatures.add(pageIds.joinToString(","))) break
+            pageIds.forEach { songIds.add(it) }
+            offset += songPage.items.size
+            if (songPage.next.isBlank() && songPage.total > 0 && offset >= songPage.total) break
+            songPage = getPlaylistTracks(favoritePlaylist.id, 100, offset)
+            guard++
+        }
+        return songIds
+    }
+
     /**
      * **目录歌单**的曲目。
      *
@@ -219,6 +287,7 @@ class AppleApi(private val prefs: TokenStore) {
         "jp" -> "ja-JP"
         "kr" -> "ko-KR"
         "tw", "hk" -> "zh-Hant-TW"
+        "tr" -> "tr-TR"
         else -> "en-US"
     }
 
@@ -510,6 +579,28 @@ class AppleApi(private val prefs: TokenStore) {
         return page.items.firstOrNull()
     }
 
+    /** 电台曲目显示元数据优先使用简体中文，没有本地化时退回当前 storefront 语言。 */
+    fun getCatalogSongLocalized(songId: String): AppleSong? {
+        if (songId.isBlank()) return null
+        val languages = listOf("zh-Hans-CN", langTag()).distinct()
+        var firstResult: AppleSong? = null
+        for (language in languages) {
+            val txt = ampGet(
+                "/v1/catalog/$storefront/songs/$songId?l=$language&include=albums,artists"
+            )
+            val song = parseSongs(txt, false).items.firstOrNull() ?: continue
+            if (firstResult == null) firstResult = song
+            if (language == "zh-Hans-CN" && hasHanCharacters(song.name + song.artistName)) {
+                return song
+            }
+            if (language == langTag()) return song
+        }
+        return firstResult
+    }
+
+    private fun hasHanCharacters(text: String): Boolean =
+        text.any { it in '\u3400'..'\u9fff' }
+
     /** 把一首目录歌曲加入用户的 Apple Music 资料库。 */
     fun addCatalogSongToLibrary(songId: String): Boolean {
         if (songId.isEmpty()) return false
@@ -530,6 +621,37 @@ class AppleApi(private val prefs: TokenStore) {
             Logx.w(TAG, "add song exception: ${e.message}")
             false
         }
+    }
+
+    /** 使用 Apple Music 网页端使用的接口切换目录歌曲的收藏状态。 */
+    fun setCatalogSongFavorite(songId: String, favorite: Boolean) {
+        require(songId.matches(Regex("[A-Za-z0-9._-]+"))) { "无效的歌曲 ID" }
+        val encodedId = java.net.URLEncoder.encode(songId, "UTF-8")
+        val path = "/v1/me/favorites?art%5Burl%5D=f&ids%5Bsongs%5D=$encodedId" +
+            "&l=zh-Hans-CN&platform=web"
+        ensureReady()
+        val requestHeaders = LinkedHashMap(headers(true)).apply {
+            put("media-user-token", userToken)
+        }
+        val response = Http.request(
+            AppleConst.AMP + path,
+            if (favorite) "POST" else "DELETE",
+            requestHeaders,
+            null,
+            15000,
+            30000
+        )
+        if (response.code !in 200..299) {
+            throw IllegalStateException(
+                "${if (favorite) "收藏" else "取消收藏"}失败，HTTP " +
+                    "${response.code}：${response.text.take(300)}"
+            )
+        }
+        Logx.i(
+            TAG,
+            "catalog song ${if (favorite) "favorited" else "unfavorited"} " +
+                "(${response.code}): $songId"
+        )
     }
 
     /**
@@ -854,6 +976,27 @@ class AppleApi(private val prefs: TokenStore) {
         return parseShelves(JSONObject(txt))
     }
 
+    /** 请求网页版实际使用的个性电台 next-tracks 接口。 */
+    fun probeStationNextTracks(stationId: String, limit: Int? = null): StationProbeResponse {
+        require(stationId.matches(Regex("[A-Za-z0-9._-]+"))) { "无效的电台 ID" }
+        require(limit == null || limit in 1..20) { "电台歌曲数量必须在 1 到 20 之间" }
+        val path = "/v1/me/stations/next-tracks/$stationId" +
+            (limit?.let { "?limit=$it" } ?: "")
+        ensureReady()
+        val requestHeaders = LinkedHashMap(headers(true)).apply {
+            put("media-user-token", userToken)
+        }
+        val response = Http.request(
+            AppleConst.AMP + path,
+            "POST",
+            requestHeaders,
+            null,
+            15000,
+            30000
+        )
+        return StationProbeResponse(path, response.code, response.text)
+    }
+
     /**
      * **新发现**：排行榜。
      *
@@ -971,10 +1114,8 @@ class AppleApi(private val prefs: TokenStore) {
     /**
      * 把主页货架里的「电台」挑出来，给**广播**页用。
      *
-     * ⚠️ 限制：Apple 的个性化电台（`kind=user`）没有可枚举的曲目接口 ——
-     * `/v1/me/stations/{id}/tracks`、`/next-tracks`、`/catalog/{sf}/stations/{id}/tracks`
-     * 全部 404/400（曲目由服务端按需生成，只有官方客户端能拿）。
-     * 所以广播页只做展示，点按会给出明确提示，不做假动作。
+     * 个性电台曲目由服务端按需生成，常规目录关系接口未必能读取。
+     * 候选端点可从独立的电台诊断页按账号实测；此列表仍只用于展示。
      */
     fun stationsFrom(shelves: List<Shelf>): List<Shelf> =
         shelves.filter { sh -> sh.items.any { it.isStation } }

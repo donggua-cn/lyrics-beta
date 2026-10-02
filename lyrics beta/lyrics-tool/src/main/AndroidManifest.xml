@@ -30,6 +30,12 @@
             android:name=".ui.AppleMusicLoginActivity"
             android:exported="false"
             android:windowSoftInputMode="adjustResize" />
+        <activity
+            android:name=".ui.RadioProbeActivity"
+            android:exported="false" />
+        <activity
+            android:name=".ui.FavoriteSongsProbeActivity"
+            android:exported="false" />
         <service
             android:name="com.applemusic.android.player.MusicService"
             android:exported="true"

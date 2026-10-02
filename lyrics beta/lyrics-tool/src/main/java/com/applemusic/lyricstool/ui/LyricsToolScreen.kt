@@ -4,7 +4,9 @@ import android.Manifest
 import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Typeface
 import android.os.Build
+import android.provider.OpenableColumns
 import android.util.Log
 import android.view.MotionEvent
 import android.view.ViewConfiguration
@@ -39,10 +41,16 @@ import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -87,8 +95,10 @@ import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.Translate
+import androidx.compose.material.icons.outlined.StarBorder
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -115,6 +125,7 @@ import androidx.compose.material3.lightColorScheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.FilterChip
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -123,12 +134,16 @@ import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
@@ -138,10 +153,14 @@ import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.webkit.WebViewAssetLoader
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -150,6 +169,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogWindowProvider
 import androidx.core.graphics.drawable.toBitmap
 import coil.compose.AsyncImage
 import coil.ImageLoader
@@ -176,6 +196,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayInputStream
+import java.io.File
+import java.io.FileInputStream
+import java.util.UUID
 import java.util.Locale
 import kotlin.math.roundToInt
 
@@ -277,11 +300,14 @@ private data class LyricsAppearance(
     val glowRadius: Float = 5f,
     val fontSize: Float = 28f,
     val lineSpacing: Float = 18f,
+    val currentLinePosition: Float = 18f,
     val autoScroll: Boolean = true,
     val interpolate: Boolean = true,
     val blur: Boolean = false,
     val reducedMotion: Boolean = false,
-    val hidePlayedLines: Boolean = false
+    val hidePlayedLines: Boolean = false,
+    val customFontFileName: String? = null,
+    val customFontDisplayName: String? = null
 )
 
 private data class LyricsFetchResult(
@@ -403,6 +429,8 @@ internal fun LyricsToolScreen(
     nowPlayingRequest: Long = 0L
 ) {
     val context = LocalContext.current
+    val view = LocalView.current
+    val density = LocalDensity.current
     val lyricsCache = remember(context) { LyricsCache(context) }
     val themePreferences = remember(context) {
         context.getSharedPreferences("app_theme", android.content.Context.MODE_PRIVATE)
@@ -450,7 +478,13 @@ internal fun LyricsToolScreen(
         var lyricsNotice by remember { mutableStateOf<String?>(null) }
         var query by remember { mutableStateOf("") }
         var songs by remember { mutableStateOf<List<SongHit>>(emptyList()) }
+        var lyricSearchUsed by remember { mutableStateOf(false) }
         var selectedSong by remember { mutableStateOf<SongHit?>(null) }
+        var lyricsCollapsed by remember { mutableStateOf(false) }
+        var lyricsInteractionVersion by remember { mutableLongStateOf(0L) }
+        var favoritedSongIds by remember { mutableStateOf<Set<String>?>(null) }
+        var favoriteStatusLoading by remember { mutableStateOf(false) }
+        var favoritePendingSongId by remember { mutableStateOf<String?>(null) }
         var selectedPage by remember { mutableStateOf(ToolPage.Search) }
         var fullscreenLyrics by remember { mutableStateOf(false) }
         var lyricsNavigationVisible by remember { mutableStateOf(false) }
@@ -462,6 +496,10 @@ internal fun LyricsToolScreen(
         var playbackDurationMs by remember { mutableStateOf(0L) }
         var playbackIsPlaying by remember { mutableStateOf(false) }
         var nowPlayingSong by remember { mutableStateOf(PlaybackEngine.currentSong()?.toSongHitOrNull()) }
+        var playbackQueue by remember { mutableStateOf<List<Pair<Int, String>>>(emptyList()) }
+        var playbackQueueIndex by remember { mutableStateOf(-1) }
+        var queueDialogOpen by remember { mutableStateOf(false) }
+        var coverQueueDragOffset by remember { mutableFloatStateOf(0f) }
         var playbackStatus by remember { mutableStateOf("") }
         var preparing by remember { mutableStateOf(true) }
         var signedIn by remember { mutableStateOf(client.isSignedIn) }
@@ -476,6 +514,9 @@ internal fun LyricsToolScreen(
         val appearancePreferences = remember(context) {
             context.getSharedPreferences("lyrics_appearance", android.content.Context.MODE_PRIVATE)
         }
+        val collapsedArtworkPreferences = remember(context) {
+            context.getSharedPreferences("collapsed_lyrics_artwork", android.content.Context.MODE_PRIVATE)
+        }
         var lyricsAppearance by remember(context) {
             mutableStateOf(
                 LyricsAppearance(
@@ -485,15 +526,26 @@ internal fun LyricsToolScreen(
                     glowRadius = appearancePreferences.getFloat("glow_radius", 5f),
                     fontSize = appearancePreferences.getFloat("font_size", 28f),
                     lineSpacing = appearancePreferences.getFloat("line_spacing", 18f),
+                    currentLinePosition = appearancePreferences.getFloat(
+                        "current_line_position",
+                        18f
+                    ),
                     autoScroll = appearancePreferences.getBoolean("auto_scroll", true),
                     interpolate = appearancePreferences.getBoolean("interpolate", true),
                     blur = appearancePreferences.getBoolean("blur", false),
                     reducedMotion = appearancePreferences.getBoolean("reduced_motion", false),
-                    hidePlayedLines = appearancePreferences.getBoolean("hide_played_lines", false)
+                    hidePlayedLines = appearancePreferences.getBoolean("hide_played_lines", false),
+                    customFontFileName = appearancePreferences
+                        .getString("custom_font_file", null)
+                        ?.takeIf { it.matches(Regex("lyrics-[a-f0-9-]+\\.(ttf|otf)")) },
+                    customFontDisplayName = appearancePreferences
+                        .getString("custom_font_name", null)
                 )
             )
         }
         var coverAccentColor by remember { mutableStateOf<String?>(null) }
+        var coverAccentResolvedFor by remember { mutableStateOf<String?>(null) }
+        var coverAccentColors by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
         var pendingExport by remember { mutableStateOf<Pair<String, ExportFormat>?>(null) }
         var cacheManagerOpen by remember { mutableStateOf(false) }
         var cachedItems by remember { mutableStateOf<List<AppleCache.CacheItem>>(emptyList()) }
@@ -507,6 +559,72 @@ internal fun LyricsToolScreen(
                 context.getSharedPreferences("lyrics_appearance", android.content.Context.MODE_PRIVATE)
                     .getBoolean("status_bar_lyrics_enabled", true)
             )
+        }
+        var lyricsFullscreenEnabled by remember(context) {
+            mutableStateOf(
+                appearancePreferences.getBoolean("lyrics_fullscreen_enabled", true)
+            )
+        }
+        val immersiveLyrics = lyricsFullscreenEnabled &&
+            selectedSong != null && selectedPage == ToolPage.Search
+        val playbackCardTopInset = remember(view, immersiveLyrics, density) {
+            if (!immersiveLyrics) {
+                0.dp
+            } else {
+                val rootInsets = view.rootWindowInsets
+                val safeTopPx = if (
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+                    rootInsets != null
+                ) {
+                    maxOf(
+                        rootInsets.getInsetsIgnoringVisibility(
+                            android.view.WindowInsets.Type.statusBars()
+                        ).top,
+                        rootInsets.displayCutout?.safeInsetTop ?: 0
+                    )
+                } else {
+                    rootInsets?.systemWindowInsetTop ?: 0
+                }
+                val fallbackTopPx = if (safeTopPx == 0) {
+                    val resourceId = context.resources.getIdentifier(
+                        "status_bar_height",
+                        "dimen",
+                        "android"
+                    )
+                    if (resourceId != 0) {
+                        context.resources.getDimensionPixelSize(resourceId)
+                    } else {
+                        0
+                    }
+                } else {
+                    safeTopPx
+                }
+                with(density) { fallbackTopPx.toDp() }
+            }
+        }
+        DisposableEffect(view, immersiveLyrics) {
+            val window = (context as? Activity)?.window
+            val controller = window?.let { WindowInsetsControllerCompat(it, view) }
+            val wasFullscreen = window?.let {
+                it.attributes.flags and android.view.WindowManager.LayoutParams.FLAG_FULLSCREEN != 0
+            } ?: false
+            if (immersiveLyrics) {
+                window?.addFlags(android.view.WindowManager.LayoutParams.FLAG_FULLSCREEN)
+                controller?.systemBarsBehavior =
+                    WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                controller?.hide(WindowInsetsCompat.Type.statusBars())
+            } else {
+                window?.clearFlags(android.view.WindowManager.LayoutParams.FLAG_FULLSCREEN)
+                controller?.show(WindowInsetsCompat.Type.statusBars())
+            }
+            onDispose {
+                if (wasFullscreen) {
+                    window?.addFlags(android.view.WindowManager.LayoutParams.FLAG_FULLSCREEN)
+                } else {
+                    window?.clearFlags(android.view.WindowManager.LayoutParams.FLAG_FULLSCREEN)
+                }
+                controller?.show(WindowInsetsCompat.Type.statusBars())
+            }
         }
         LaunchedEffect(selectedSong?.id, selectedPage, fullscreenLyrics, lyricsNavigationVisible) {
             if (selectedSong == null || selectedPage != ToolPage.Search) {
@@ -551,6 +669,71 @@ internal fun LyricsToolScreen(
         val openLogin = {
             loginLauncher.launch(Intent(context, AppleMusicLoginActivity::class.java))
         }
+        val refreshFavoriteStatus: () -> Unit = {
+            if (!favoriteStatusLoading) {
+                scope.launch {
+                    favoriteStatusLoading = true
+                    try {
+                        favoritedSongIds = withContext(Dispatchers.IO) {
+                            MusicRepository.api.getFavoriteCatalogSongIds()
+                        }
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (error: Exception) {
+                        favoritedSongIds = null
+                        snackbar.showSnackbar(
+                            "无法读取 Apple Music 喜爱歌曲列表：" +
+                                (error.message ?: "请稍后重试")
+                        )
+                    } finally {
+                        favoriteStatusLoading = false
+                    }
+                }
+            }
+        }
+        LaunchedEffect(signedIn, selectedSong?.id) {
+            favoritedSongIds = null
+            if (signedIn && selectedSong != null) refreshFavoriteStatus()
+        }
+        val toggleSongFavorite: (SongHit) -> Unit = { song ->
+            val catalogId = song.favoriteCatalogId()
+            if (catalogId.isBlank()) {
+                scope.launch { snackbar.showSnackbar("无法确定这首歌的 Apple Music 曲库 ID") }
+            } else if (favoritePendingSongId == null) {
+                val knownFavoriteIds = favoritedSongIds
+                if (knownFavoriteIds == null) {
+                    refreshFavoriteStatus()
+                } else {
+                    val favorite = catalogId !in knownFavoriteIds
+                    scope.launch {
+                        favoritePendingSongId = catalogId
+                        try {
+                            withContext(Dispatchers.IO) {
+                                MusicRepository.api.setCatalogSongFavorite(catalogId, favorite)
+                            }
+                            favoritedSongIds = if (favorite) {
+                                knownFavoriteIds + catalogId
+                            } else {
+                                knownFavoriteIds - catalogId
+                            }
+                            snackbar.showSnackbar(
+                                if (favorite) "已收藏到 Apple Music 资料库"
+                                else "已从 Apple Music 收藏中移除"
+                            )
+                        } catch (error: CancellationException) {
+                            throw error
+                        } catch (error: Exception) {
+                            snackbar.showSnackbar(
+                                "${if (favorite) "收藏" else "取消收藏"}失败：" +
+                                    (error.message ?: "请稍后重试")
+                            )
+                        } finally {
+                            favoritePendingSongId = null
+                        }
+                    }
+                }
+            }
+        }
         LaunchedEffect(selectedPage) {
             if (selectedPage == ToolPage.Settings) {
                 cachedItems = MusicRepository.cache.cachedItems()
@@ -569,6 +752,7 @@ internal fun LyricsToolScreen(
         fun openLyricsForSong(song: SongHit) {
             selectedPage = ToolPage.Search
             selectedSong = song
+            lyricsCollapsed = false
             sourceLookupRequest = 0
             fullscreenLyrics = false
             fetchedLyrics = null
@@ -669,21 +853,120 @@ internal fun LyricsToolScreen(
                 .putFloat("glow_radius", appearance.glowRadius)
                 .putFloat("font_size", appearance.fontSize)
                 .putFloat("line_spacing", appearance.lineSpacing)
+                .putFloat("current_line_position", appearance.currentLinePosition)
                 .putBoolean("auto_scroll", appearance.autoScroll)
                 .putBoolean("interpolate", appearance.interpolate)
                 .putBoolean("blur", appearance.blur)
                 .putBoolean("reduced_motion", appearance.reducedMotion)
                 .putBoolean("hide_played_lines", appearance.hidePlayedLines)
+                .putString("custom_font_file", appearance.customFontFileName)
+                .putString("custom_font_name", appearance.customFontDisplayName)
                 .apply()
+        }
+
+        val selectLyricsFont = rememberLauncherForActivityResult(
+            ActivityResultContracts.OpenDocument()
+        ) { uri ->
+            if (uri == null) return@rememberLauncherForActivityResult
+            scope.launch {
+                var temporaryFile: File? = null
+                try {
+                    val displayName = withContext(Dispatchers.IO) {
+                        context.contentResolver.query(
+                            uri,
+                            arrayOf(OpenableColumns.DISPLAY_NAME),
+                            null,
+                            null,
+                            null
+                        )?.use { cursor ->
+                            if (cursor.moveToFirst()) {
+                                cursor.getString(cursor.getColumnIndexOrThrow(OpenableColumns.DISPLAY_NAME))
+                            } else {
+                                null
+                            }
+                        }
+                    } ?: "custom-font"
+                    val extension = displayName.substringAfterLast('.', "").lowercase(Locale.US)
+                    require(extension == "ttf" || extension == "otf") {
+                        "请选择 .ttf 或 .otf 格式的字体文件"
+                    }
+                    val fileName = "lyrics-${UUID.randomUUID()}.$extension"
+                    val fontDirectory = File(context.filesDir, "lyrics-fonts")
+                    val savedFile = File(fontDirectory, fileName)
+                    val tempFile = File(fontDirectory, "$fileName.tmp")
+                    temporaryFile = tempFile
+                    withContext(Dispatchers.IO) {
+                        check(fontDirectory.exists() || fontDirectory.mkdirs()) {
+                            "无法创建字体存储目录"
+                        }
+                        val source = context.contentResolver.openInputStream(uri)
+                            ?: error("无法读取所选字体文件")
+                        source.use { input ->
+                            tempFile.outputStream().buffered().use { output ->
+                                val buffer = ByteArray(8192)
+                                var totalBytes = 0L
+                                while (true) {
+                                    val count = input.read(buffer)
+                                    if (count < 0) break
+                                    totalBytes += count
+                                    require(totalBytes <= MAX_CUSTOM_FONT_BYTES) {
+                                        "字体文件不能超过 20 MB"
+                                    }
+                                    output.write(buffer, 0, count)
+                                }
+                            }
+                        }
+                        Typeface.createFromFile(tempFile)
+                        check(tempFile.renameTo(savedFile)) {
+                            "无法保存字体文件"
+                        }
+                    }
+                    val oldFile = lyricsAppearance.customFontFileName
+                        ?.let { File(fontDirectory, it) }
+                    updateLyricsAppearance(
+                        lyricsAppearance.copy(
+                            customFontFileName = fileName,
+                            customFontDisplayName = displayName
+                        )
+                    )
+                    if (oldFile != null && oldFile != savedFile) oldFile.delete()
+                    snackbar.showSnackbar("已应用字体：$displayName")
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    temporaryFile?.delete()
+                    snackbar.showSnackbar(
+                        "字体导入失败：${error.message ?: "请确认文件是有效的 TTF/OTF 字体"}"
+                    )
+                }
+            }
+        }
+        val clearLyricsFont: () -> Unit = {
+            lyricsAppearance.customFontFileName?.let {
+                File(File(context.filesDir, "lyrics-fonts"), it).delete()
+            }
+            updateLyricsAppearance(
+                lyricsAppearance.copy(
+                    customFontFileName = null,
+                    customFontDisplayName = null
+                )
+            )
+            scope.launch { snackbar.showSnackbar("已恢复默认歌词字体") }
         }
 
         LaunchedEffect(selectedSong?.artworkUrl) {
             val artworkUrl = selectedSong?.artworkUrl
+            val cachedAccent = artworkUrl?.let(coverAccentColors::get)
+            coverAccentColor = cachedAccent
+            coverAccentResolvedFor = if (artworkUrl.isNullOrBlank() || cachedAccent != null) {
+                artworkUrl
+            } else {
+                null
+            }
             if (artworkUrl.isNullOrBlank()) {
-                coverAccentColor = null
                 return@LaunchedEffect
             }
-            coverAccentColor = null
+            if (cachedAccent != null) return@LaunchedEffect
             val request = ImageRequest.Builder(context)
                 .data(artworkUrl)
                 .size(256)
@@ -701,21 +984,31 @@ internal fun LyricsToolScreen(
                         ?: palette.lightVibrantSwatch
                         ?: palette.mutedSwatch
                         ?: palette.dominantSwatch
-                    coverAccentColor = accent?.rgb?.let {
+                    val extractedAccent = accent?.rgb?.let {
                         "#%06X".format(Locale.US, 0xFFFFFF and it)
+                    }
+                    coverAccentColor = extractedAccent
+                    coverAccentResolvedFor = artworkUrl
+                    if (extractedAccent != null) {
+                        coverAccentColors = coverAccentColors + (artworkUrl to extractedAccent)
                     }
                     if (accent == null) {
                         lyricsNotice = "无法从封面提取强调色，继续使用默认颜色"
                     }
                 } else if (result is ErrorResult) {
+                    coverAccentResolvedFor = artworkUrl
                     lyricsNotice = "封面加载失败，无法提取强调色"
                 }
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
+                coverAccentResolvedFor = artworkUrl
                 lyricsNotice = "封面加载失败：${error.message ?: "无法提取强调色"}"
             }
         }
+        val coverAccentReady = !lyricsAppearance.useCoverAccent ||
+            selectedSong?.artworkUrl.isNullOrBlank() ||
+            coverAccentResolvedFor == selectedSong?.artworkUrl
 
         val effectiveLyricsAppearance = remember(
             lyricsAppearance,
@@ -770,14 +1063,21 @@ internal fun LyricsToolScreen(
             if (term.isEmpty() || searching) return
             searching = true
             songs = emptyList()
+            lyricSearchUsed = false
             selectedSong = null
             fullscreenLyrics = false
             fetchedLyrics = null
             lyricsError = null
             scope.launch {
                 try {
-                    songs = client.searchSongs(term)
-                    if (songs.isEmpty()) snackbar.showSnackbar("没有找到歌曲，试试歌名或艺人名")
+                    val titleMatches = client.searchSongs(term)
+                    if (titleMatches.isNotEmpty()) {
+                        songs = titleMatches
+                    } else {
+                        lyricSearchUsed = true
+                        songs = client.searchSongsByLyrics(term, qqMusicClient)
+                    }
+                    if (songs.isEmpty()) snackbar.showSnackbar("没有找到歌曲，试试歌名、艺人名或歌词内容")
                 } catch (error: Exception) {
                     snackbar.showSnackbar(error.message ?: "搜索失败，请稍后重试")
                 } finally {
@@ -836,7 +1136,25 @@ internal fun LyricsToolScreen(
             while (true) {
                 val row = PlaybackEngine.currentSong()
                 val currentSong = row?.toSongHitOrNull()
-                if (nowPlayingSong != currentSong) nowPlayingSong = currentSong
+                if (nowPlayingSong != currentSong) {
+                    nowPlayingSong = currentSong
+                    if (
+                        currentSong != null &&
+                        selectedSong != null &&
+                        selectedSong?.id != currentSong.id &&
+                        !PlaybackEngine.preparing
+                    ) {
+                        openLyricsForSong(currentSong)
+                    }
+                }
+                val queueEntries = PlaybackEngine.queueSnapshot().mapIndexed { index, uri ->
+                    index to uri
+                }
+                if (playbackQueue != queueEntries) playbackQueue = queueEntries
+                val currentQueueIndex = PlaybackEngine.currentQueueIndex()
+                if (playbackQueueIndex != currentQueueIndex) {
+                    playbackQueueIndex = currentQueueIndex
+                }
                 playbackPositionMs = PlaybackEngine.positionMs()
                 playbackDurationMs = maxOf(
                     PlaybackEngine.durationMs(),
@@ -848,9 +1166,68 @@ internal fun LyricsToolScreen(
             }
         }
 
+        LaunchedEffect(playbackQueue, playbackQueueIndex) {
+            val nextUri = playbackQueue
+                .firstOrNull { (index, _) -> index == playbackQueueIndex + 1 }
+                ?.second ?: return@LaunchedEffect
+            val row = MusicRepository.findSong(nextUri) ?: return@LaunchedEffect
+            val song = row.toSongHitOrNull() ?: return@LaunchedEffect
+            val songId = row.appleId.ifBlank { song.id }
+            MusicRepository.cache.preload(
+                songId = songId,
+                isLibrary = row.isLibrary,
+                metadata = com.applemusic.android.apple.AppleCache.SongMetadata(
+                    title = row.title,
+                    artist = row.artist,
+                    album = row.album
+                )
+            )
+            scope.launch {
+                try {
+                    fetchAppleLyricsWithQqFallback(
+                        client,
+                        qqMusicClient,
+                        lyricsCache,
+                        song
+                    )
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    Log.w("LyricsPrefetch", "预加载下一首歌词失败 (${song.id})", error)
+                }
+            }
+        }
+
+        LaunchedEffect(
+            selectedSong?.id,
+            selectedPage,
+            lyricsCollapsed,
+            lyricsInteractionVersion,
+            queueDialogOpen,
+            lyricsAppearanceOpen,
+            cacheManagerOpen
+        ) {
+            if (
+                selectedSong == null ||
+                selectedPage != ToolPage.Search ||
+                lyricsCollapsed ||
+                queueDialogOpen ||
+                lyricsAppearanceOpen ||
+                cacheManagerOpen
+            ) {
+                return@LaunchedEffect
+            }
+            delay(8_000L)
+            lyricsCollapsed = true
+            fullscreenLyrics = false
+            lyricsNavigationVisible = false
+        }
+
         BackHandler(enabled = selectedSong != null || selectedPage != ToolPage.Search) {
             if (fullscreenLyrics) {
                 fullscreenLyrics = false
+            } else if (lyricsCollapsed) {
+                lyricsCollapsed = false
             } else if (selectedPage != ToolPage.Search) {
                 selectedPage = ToolPage.Search
             } else {
@@ -869,7 +1246,10 @@ internal fun LyricsToolScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(padding)
-                        .padding(top = WindowInsets.statusBars.asPaddingValues().calculateTopPadding())
+                    .padding(
+                        top = if (immersiveLyrics) playbackCardTopInset
+                        else WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+                    )
             ) {
                 Column(
                         modifier = Modifier
@@ -938,7 +1318,7 @@ internal fun LyricsToolScreen(
                                         modifier = Modifier.weight(1f),
                                         shape = RoundedCornerShape(28.dp),
                                         singleLine = true,
-                                        placeholder = { Text("歌名或艺人") },
+                                        placeholder = { Text("歌名、艺人或歌词") },
                                         leadingIcon = {
                                             Icon(Icons.Filled.Search, contentDescription = null)
                                         },
@@ -962,9 +1342,9 @@ internal fun LyricsToolScreen(
                                         } else {
                                             Text("搜索", fontWeight = FontWeight.Bold)
                                         }
-                                    }
                                 }
                             }
+                        }
                         }
 
                         if (cacheManagerOpen) {
@@ -1015,6 +1395,36 @@ internal fun LyricsToolScreen(
                                         }
                                     }
                                 },
+                                onClearAll = {
+                                    scope.launch {
+                                        var playbackRemoved = 0
+                                        var lyricsRemoved = 0
+                                        val failures = mutableListOf<String>()
+                                        try {
+                                            playbackRemoved = withContext(Dispatchers.IO) {
+                                                MusicRepository.cache.clearAllCached()
+                                            }
+                                        } catch (error: Exception) {
+                                            failures += error.message ?: "清除播放缓存失败"
+                                        }
+                                        try {
+                                            lyricsRemoved = lyricsCache.clearAll()
+                                        } catch (error: Exception) {
+                                            failures += error.message ?: "清除歌词缓存失败"
+                                        }
+                                        cachedItems = MusicRepository.cache.cachedItems()
+                                        cachedLyricsItems = lyricsCache.cachedItems()
+                                        if (failures.isEmpty()) {
+                                            snackbar.showSnackbar(
+                                                "已清除全部缓存（$playbackRemoved 个歌曲缓存文件，$lyricsRemoved 个歌词缓存文件）"
+                                            )
+                                        } else {
+                                            snackbar.showSnackbar(
+                                                "缓存未能全部清除：${failures.joinToString("；")}"
+                                            )
+                                        }
+                                    }
+                                },
                                 onTogglePinned = { item ->
                                     MusicRepository.cache.setPinned(item.songId, !item.pinned)
                                     cachedItems = MusicRepository.cache.cachedItems()
@@ -1054,7 +1464,24 @@ internal fun LyricsToolScreen(
                                 appearance = lyricsAppearance,
                                 coverAccentColor = coverAccentColor,
                                 onAppearanceChange = updateLyricsAppearance,
+                                onSelectFont = {
+                                    selectLyricsFont.launch(arrayOf("*/*"))
+                                },
+                                onClearFont = clearLyricsFont,
                                 onDismiss = { lyricsAppearanceOpen = false }
+                            )
+                        }
+
+                        if (queueDialogOpen) {
+                            PlaybackQueueDialog(
+                                entries = playbackQueue,
+                                currentIndex = playbackQueueIndex,
+                                anchorArtworkUrl = selectedSong?.artworkUrl.orEmpty(),
+                                onDismiss = { queueDialogOpen = false },
+                                onSelect = { index ->
+                                    queueDialogOpen = false
+                                    PlaybackEngine.playAt(index)
+                                }
                             )
                         }
 
@@ -1064,6 +1491,7 @@ internal fun LyricsToolScreen(
                                 cacheCount = cachedItems.size,
                                 cacheBytes = cachedItems.sumOf { it.size },
                                 statusBarLyricsEnabled = statusBarLyricsEnabled,
+                                lyricsFullscreenEnabled = lyricsFullscreenEnabled,
                                 themeMode = themeMode,
                                 useDynamicColors = useDynamicColors,
                                 manualThemeSeedHex = manualThemeSeedHex,
@@ -1089,6 +1517,12 @@ internal fun LyricsToolScreen(
                                     statusBarLyricsEnabled = enabled
                                     LiveLyricsNotification.setEnabled(context, enabled)
                                 },
+                                onLyricsFullscreenEnabledChange = { enabled ->
+                                    lyricsFullscreenEnabled = enabled
+                                    appearancePreferences.edit()
+                                        .putBoolean("lyrics_fullscreen_enabled", enabled)
+                                        .apply()
+                                },
                                 onOpenCache = {
                                     scope.launch {
                                         val playback = MusicRepository.cache.cachedItems()
@@ -1102,6 +1536,11 @@ internal fun LyricsToolScreen(
                                         cachedLyricsItems = lyricsCache.cachedItems()
                                         cacheManagerOpen = true
                                     }
+                                },
+                                onOpenFavoriteSongsProbe = {
+                                    context.startActivity(
+                                        Intent(context, FavoriteSongsProbeActivity::class.java)
+                                    )
                                 }
                             )
                         } else {
@@ -1118,6 +1557,7 @@ internal fun LyricsToolScreen(
                                                 song = song,
                                                 fetchedLyrics = fetchedLyrics,
                                                 lyricsNotice = lyricsNotice,
+                                                playbackControlsVisible = !lyricsCollapsed,
                                                 error = lyricsError,
                                                 loading = loadingLyrics,
                                                 signedIn = signedIn,
@@ -1130,6 +1570,7 @@ internal fun LyricsToolScreen(
                                                 sourceLookupInProgress = sourceLookupInProgress,
                                                 sourceLookupRequest = sourceLookupRequest,
                                                 lyricsAppearance = effectiveLyricsAppearance,
+                                                coverAccentReady = coverAccentReady,
                                                 accentColor = playbackAccentColor,
                                                 preparing = PlaybackEngine.preparing,
                                                 playbackStatus = playbackStatus,
@@ -1137,7 +1578,25 @@ internal fun LyricsToolScreen(
                                                 onToggleFullscreen = {
                                                     fullscreenLyrics = !fullscreenLyrics
                                                 },
+                                                onCollapseLyrics = {
+                                                    lyricsCollapsed = true
+                                                    fullscreenLyrics = false
+                                                    lyricsNavigationVisible = false
+                                                },
                                                 onLogin = openLogin,
+                                                onOpenQueue = { queueDialogOpen = true },
+                                                onQueueDragOffsetChange = {
+                                                    coverQueueDragOffset = it
+                                                },
+                                                coverQueueDragOffset = coverQueueDragOffset,
+                                                isFavorited = song.favoriteCatalogId().let { catalogId ->
+                                                    favoritedSongIds?.let { ids ->
+                                                        catalogId.takeIf(String::isNotBlank)?.let(ids::contains)
+                                                    }
+                                                },
+                                                favoritePending = song.favoriteCatalogId()
+                                                        .let { it.isNotBlank() && it == favoritePendingSongId },
+                                                onToggleFavorite = { toggleSongFavorite(song) },
                                                 onTogglePlayback = {
                                                     if (PlaybackEngine.preparingNote.startsWith("无法播放")) {
                                                         val row = AppleLibrarySync.SongRow().apply {
@@ -1350,7 +1809,13 @@ internal fun LyricsToolScreen(
                                                         }
                                                     }
                                                 },
-                                                onLyricsScroll = { lyricsNavigationVisible = true },
+                                                onLyricsScroll = {
+                                                    lyricsNavigationVisible = true
+                                                    lyricsInteractionVersion++
+                                                },
+                                                onUserInteraction = {
+                                                    lyricsInteractionVersion++
+                                                },
                                                 onTranslationUnavailable = {
                                                     lyricsNotice = "这份歌词没有译文"
                                                 }
@@ -1362,9 +1827,11 @@ internal fun LyricsToolScreen(
                                         songs = songs,
                                         searching = searching,
                                         query = query,
+                                        lyricMatches = lyricSearchUsed,
                                         onSongClick = { song ->
                                             sourceLookupRequest = 0
                                             fullscreenLyrics = false
+                                            lyricsCollapsed = false
                                             selectedSong = song
                                             fetchedLyrics = null
                                             loadingLyrics = true
@@ -1466,13 +1933,87 @@ internal fun LyricsToolScreen(
                             durationMs = playbackDurationMs,
                             onOpen = { openLyricsForSong(song) },
                             onTogglePlayback = { PlaybackEngine.toggle() },
-                            onNext = { PlaybackEngine.next() }
+                            onNext = { PlaybackEngine.next() },
+                            onPrevious = { PlaybackEngine.prev() }
                         )
                     }
                 }
 
                 AnimatedVisibility(
+                    visible = lyricsCollapsed && selectedSong != null,
+                    enter = fadeIn(animationSpec = tween(180)),
+                    exit = fadeOut(animationSpec = tween(130)),
+                    modifier = Modifier.fillMaxSize()
+                ) {
+                    BoxWithConstraints(Modifier.fillMaxSize()) {
+                        val overlayDensity = androidx.compose.ui.platform.LocalDensity.current
+                        var artworkX by remember(collapsedArtworkPreferences) {
+                            mutableFloatStateOf(
+                                collapsedArtworkPreferences.getFloat("x_dp", 16f)
+                            )
+                        }
+                        var artworkY by remember(collapsedArtworkPreferences) {
+                            mutableFloatStateOf(
+                                collapsedArtworkPreferences.getFloat("y_dp", 12f)
+                            )
+                        }
+                        AnimatedVisibility(
+                            visible = true,
+                            enter = fadeIn(animationSpec = tween(180)) +
+                                scaleIn(initialScale = 0.72f, animationSpec = tween(180)),
+                            modifier = Modifier
+                                .align(Alignment.TopStart)
+                                .offset {
+                                    val maxX = (maxWidth - 64.dp).coerceAtLeast(0.dp)
+                                    val maxY = (maxHeight - 64.dp).coerceAtLeast(0.dp)
+                                    IntOffset(
+                                        with(overlayDensity) {
+                                            artworkX.dp.coerceIn(0.dp, maxX).roundToPx()
+                                        },
+                                        with(overlayDensity) {
+                                            artworkY.dp.coerceIn(0.dp, maxY).roundToPx()
+                                        }
+                                    )
+                                }
+                        ) {
+                            selectedSong?.let { song ->
+                            CollapsedLyricsArtwork(
+                                song = song,
+                                positionMs = playbackPositionMs,
+                                durationMs = playbackDurationMs,
+                                accentColor = playbackAccentColor,
+                                onDrag = { delta ->
+                                    val maxX = with(overlayDensity) { (maxWidth - 64.dp).toPx() }
+                                        .coerceAtLeast(0f)
+                                    val maxY = with(overlayDensity) { (maxHeight - 64.dp).toPx() }
+                                        .coerceAtLeast(0f)
+                                    artworkX = (
+                                        with(overlayDensity) { artworkX.dp.toPx() } + delta.x
+                                        ).coerceIn(0f, maxX).let {
+                                            with(overlayDensity) { it.toDp() }.value
+                                        }
+                                    artworkY = (
+                                        with(overlayDensity) { artworkY.dp.toPx() } + delta.y
+                                        ).coerceIn(0f, maxY).let {
+                                            with(overlayDensity) { it.toDp() }.value
+                                        }
+                                },
+                                onDragFinished = {
+                                    collapsedArtworkPreferences.edit()
+                                        .putFloat("x_dp", artworkX)
+                                        .putFloat("y_dp", artworkY)
+                                        .apply()
+                                },
+                                onExpand = { lyricsCollapsed = false }
+                            )
+                            }
+                        }
+                    }
+                }
+
+                AnimatedVisibility(
                     visible = !fullscreenLyrics &&
+                        !lyricsCollapsed &&
                         (selectedSong == null || selectedPage != ToolPage.Search ||
                             lyricsNavigationVisible),
                     enter = fadeIn() + slideInVertically(initialOffsetY = { it }),
@@ -1500,6 +2041,7 @@ private fun SongResults(
     songs: List<SongHit>,
     searching: Boolean,
     query: String,
+    lyricMatches: Boolean,
     onSongClick: (SongHit) -> Unit
 ) {
     if (searching && songs.isEmpty()) {
@@ -1534,7 +2076,7 @@ private fun SongResults(
                 )
                 Text(
                     if (query.isBlank()) "输入歌名或艺人，找到你想要的歌词。"
-                    else "换个关键词再试试，也可以输入艺人名。",
+                    else "换个关键词再试试，也可以输入歌词中的一句。",
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 6.dp)
                 )
@@ -1554,7 +2096,7 @@ private fun SongResults(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    "搜索结果",
+                    if (lyricMatches) "歌词匹配结果" else "搜索结果",
                     style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.Bold
                 )
@@ -1634,6 +2176,7 @@ private fun LyricsDetail(
     song: SongHit,
     fetchedLyrics: FetchedLyrics?,
     lyricsNotice: String?,
+    playbackControlsVisible: Boolean,
     accentColor: Color,
     error: String?,
     loading: Boolean,
@@ -1641,17 +2184,25 @@ private fun LyricsDetail(
     positionMs: Long,
     durationMs: Long,
     isPlaying: Boolean,
+    isFavorited: Boolean?,
+    favoritePending: Boolean,
+    onToggleFavorite: () -> Unit,
     externalSourceMode: Boolean,
     externalSourceName: String?,
     externalFallbackSourceName: String?,
     sourceLookupInProgress: Boolean,
     sourceLookupRequest: Int,
     lyricsAppearance: LyricsAppearance,
+    coverAccentReady: Boolean,
     preparing: Boolean,
     playbackStatus: String,
     fullscreen: Boolean,
     onToggleFullscreen: () -> Unit,
+    onCollapseLyrics: () -> Unit,
     onLogin: () -> Unit,
+    onOpenQueue: () -> Unit,
+    onQueueDragOffsetChange: (Float) -> Unit,
+    coverQueueDragOffset: Float,
     onTogglePlayback: () -> Unit,
     onSeekTo: (Long) -> Unit,
     onRetry: () -> Unit,
@@ -1666,9 +2217,11 @@ private fun LyricsDetail(
     onSourceLookupSucceeded: (String, String) -> Unit,
     onSourceLookupFailed: () -> Unit,
     onLyricsScroll: () -> Unit,
+    onUserInteraction: () -> Unit,
     onTranslationUnavailable: () -> Unit
 ) {
     var actionsMenuExpanded by remember { mutableStateOf(false) }
+    val currentOnUserInteraction by rememberUpdatedState(onUserInteraction)
     var dragPositionMs by remember(song.id) { mutableStateOf<Long?>(null) }
     val hasTranslations = fetchedLyrics?.lyrics?.lines
         ?.any { !it.translation.isNullOrBlank() } == true
@@ -1686,6 +2239,12 @@ private fun LyricsDetail(
         modifier = Modifier
             .fillMaxSize()
             .padding(horizontal = 20.dp)
+            .pointerInput(Unit) {
+                awaitEachGesture {
+                    awaitFirstDown(requireUnconsumed = false)
+                    currentOnUserInteraction()
+                }
+            }
     ) {
         Column(Modifier.fillMaxSize()) {
             if (sourceLookupInProgress) {
@@ -1735,6 +2294,13 @@ private fun LyricsDetail(
                     CircularProgressIndicator()
                     Text("正在取回逐字歌词…", modifier = Modifier.padding(top = 14.dp))
                 }
+            }
+
+            fetchedLyrics != null && !coverAccentReady -> Box(
+                Modifier.fillMaxSize(),
+                contentAlignment = Alignment.Center
+            ) {
+                CircularProgressIndicator()
             }
 
             fetchedLyrics != null -> {
@@ -1926,7 +2492,14 @@ private fun LyricsDetail(
             )
         }
         }
-        KaraokePlaybackControls(
+        AnimatedVisibility(
+            visible = playbackControlsVisible,
+            enter = fadeIn(animationSpec = tween(180)),
+            exit = fadeOut(animationSpec = tween(150)) +
+                slideOutVertically(targetOffsetY = { -it / 4 }, animationSpec = tween(180)) +
+                scaleOut(targetScale = 0.96f, animationSpec = tween(180))
+        ) {
+            KaraokePlaybackControls(
             song = song,
             fetchedLyrics = fetchedLyrics,
             accentColor = accentColor,
@@ -1937,8 +2510,12 @@ private fun LyricsDetail(
             durationMs = durationMs,
             onLogin = onLogin,
             onTogglePlayback = onTogglePlayback,
+            isFavorited = isFavorited,
+            favoritePending = favoritePending,
+            onToggleFavorite = onToggleFavorite,
             fullscreen = fullscreen,
             onToggleFullscreen = onToggleFullscreen,
+            onCollapseLyrics = onCollapseLyrics,
             showTranslations = showTranslations,
             onToggleTranslations = {
                 if (!showTranslations && !hasTranslations) {
@@ -1947,6 +2524,11 @@ private fun LyricsDetail(
                     showTranslations = !showTranslations
                 }
             },
+            onOpenQueue = onOpenQueue,
+            onNext = { PlaybackEngine.next() },
+            onPrevious = { PlaybackEngine.prev() },
+            onQueueDragOffsetChange = onQueueDragOffsetChange,
+            coverQueueDragOffset = coverQueueDragOffset,
             onSeekStart = { dragPositionMs = it },
             onSeekChange = { dragPositionMs = it },
             onSeekFinished = {
@@ -1955,6 +2537,127 @@ private fun LyricsDetail(
             },
             modifier = Modifier.align(Alignment.TopCenter)
         )
+        }
+    }
+}
+
+@Composable
+private fun PlaybackQueueDialog(
+    entries: List<Pair<Int, String>>,
+    currentIndex: Int,
+    anchorArtworkUrl: String,
+    onDismiss: () -> Unit,
+    onSelect: (Int) -> Unit
+) {
+    Dialog(onDismissRequest = onDismiss) {
+        AnimatedVisibility(
+            visible = true,
+            enter = expandVertically(expandFrom = Alignment.Top) +
+                fadeIn() +
+                scaleIn(
+                    initialScale = 0.84f,
+                    transformOrigin = androidx.compose.ui.graphics.TransformOrigin(0.08f, 0f)
+                ) +
+                slideInVertically { -it / 5 },
+            exit = shrinkVertically(shrinkTowards = Alignment.Top) + fadeOut() +
+                scaleOut(
+                    targetScale = 0.9f,
+                    transformOrigin = androidx.compose.ui.graphics.TransformOrigin(0.08f, 0f)
+                )
+        ) {
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(24.dp),
+            color = MaterialTheme.colorScheme.surface,
+            tonalElevation = 6.dp
+        ) {
+            Column(
+                modifier = Modifier.fillMaxWidth().padding(18.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            "接下来播放",
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            "队列共 ${entries.size} 首 · ${entries.count { it.first > currentIndex }} 首在后",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    if (anchorArtworkUrl.isNotBlank()) {
+                        AsyncImage(
+                            model = anchorArtworkUrl,
+                            contentDescription = null,
+                            modifier = Modifier.size(34.dp).clip(RoundedCornerShape(9.dp))
+                        )
+                    }
+                    TextButton(onClick = onDismiss) { Text("关闭") }
+                }
+                if (entries.isEmpty()) {
+                    Text(
+                        "当前没有可显示的播放队列",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                } else {
+                    LazyColumn(
+                        modifier = Modifier.fillMaxWidth().heightIn(max = 480.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        items(entries, key = { it.first }) { (index, uri) ->
+                            val row = MusicRepository.findSong(uri)
+                            val title = row?.title?.ifBlank { null }
+                                ?: "歌曲信息暂不可用 · ${uri.removePrefix("apple:")}"
+                            val artist = row?.artist.orEmpty()
+                            val isCurrent = index == currentIndex
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(14.dp))
+                                    .background(
+                                        if (isCurrent) MaterialTheme.colorScheme.secondaryContainer
+                                        else Color.Transparent
+                                    )
+                                    .clickable { onSelect(index) }
+                                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    if (isCurrent) "正在播放" else "%02d".format(index + 1),
+                                    modifier = Modifier.width(64.dp),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (isCurrent) MaterialTheme.colorScheme.primary
+                                    else MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        title,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        fontWeight = if (isCurrent) FontWeight.SemiBold
+                                        else FontWeight.Normal
+                                    )
+                                    Text(
+                                        artist,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1963,8 +2666,17 @@ private fun LyricsAppearanceDialog(
     appearance: LyricsAppearance,
     coverAccentColor: String?,
     onAppearanceChange: (LyricsAppearance) -> Unit,
+    onSelectFont: () -> Unit,
+    onClearFont: () -> Unit,
     onDismiss: () -> Unit
 ) {
+    val positionSliderInteractionSource = remember { MutableInteractionSource() }
+    val isPositionSliderDragged by positionSliderInteractionSource.collectIsDraggedAsState()
+    val dialogView = LocalView.current
+    SideEffect {
+        val dialogWindow = (dialogView.parent as? DialogWindowProvider)?.window
+        dialogWindow?.setDimAmount(if (isPositionSliderDragged) 0f else 0.32f)
+    }
     val highlightColors = listOf(
         "#6750A4" to "薰衣草紫",
         "#007AFF" to "亮蓝",
@@ -1974,8 +2686,8 @@ private fun LyricsAppearanceDialog(
     Dialog(onDismissRequest = onDismiss) {
         Surface(
             shape = RoundedCornerShape(28.dp),
-            color = MaterialTheme.colorScheme.surface,
-            tonalElevation = 6.dp
+            color = if (isPositionSliderDragged) Color.Transparent else MaterialTheme.colorScheme.surface,
+            tonalElevation = if (isPositionSliderDragged) 0.dp else 6.dp
         ) {
             Column(
                 modifier = Modifier
@@ -1986,12 +2698,36 @@ private fun LyricsAppearanceDialog(
                     .padding(24.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
+                Column(
+                    modifier = Modifier.graphicsLayer {
+                        alpha = if (isPositionSliderDragged) 0f else 1f
+                    },
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
                 Text("歌词效果", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
                 Text(
                     "逐字发光需要歌词文件本身带有字级时间轴。",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+                Text("歌词字体", style = MaterialTheme.typography.titleSmall)
+                Text(
+                    appearance.customFontDisplayName ?: "默认字体",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = onSelectFont) {
+                        Text("上传字体")
+                    }
+                    if (appearance.customFontFileName != null) {
+                        TextButton(onClick = onClearFont) {
+                            Text("恢复默认")
+                        }
+                    }
+                }
                 AppearanceSwitch(
                     label = "从歌曲封面提取强调色",
                     checked = appearance.useCoverAccent,
@@ -2048,6 +2784,13 @@ private fun LyricsAppearanceDialog(
                         }
                     }
                 }
+                }
+                Column(
+                    modifier = Modifier.graphicsLayer {
+                        alpha = if (isPositionSliderDragged) 0f else 1f
+                    },
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
                 AppearanceSlider(
                     label = "字级发光 · ${appearance.glowRadius.toInt()} px",
                     value = appearance.glowRadius,
@@ -2066,6 +2809,22 @@ private fun LyricsAppearanceDialog(
                     range = 8f..36f,
                     onValueChange = { onAppearanceChange(appearance.copy(lineSpacing = it)) }
                 )
+                }
+                AppearanceSlider(
+                    label = "当前播放歌词位置 · ${appearance.currentLinePosition.toInt()}%",
+                    value = appearance.currentLinePosition,
+                    range = 5f..75f,
+                    onValueChange = {
+                        onAppearanceChange(appearance.copy(currentLinePosition = it))
+                    },
+                    interactionSource = positionSliderInteractionSource
+                )
+                Column(
+                    modifier = Modifier.graphicsLayer {
+                        alpha = if (isPositionSliderDragged) 0f else 1f
+                    },
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
                 AppearanceSwitch(
                     label = "逐字渐进高亮",
                     checked = appearance.interpolate,
@@ -2094,6 +2853,7 @@ private fun LyricsAppearanceDialog(
                 TextButton(onClick = onDismiss, modifier = Modifier.align(Alignment.End)) {
                     Text("完成")
                 }
+                }
             }
         }
     }
@@ -2104,11 +2864,17 @@ private fun AppearanceSlider(
     label: String,
     value: Float,
     range: ClosedFloatingPointRange<Float>,
-    onValueChange: (Float) -> Unit
+    onValueChange: (Float) -> Unit,
+    interactionSource: MutableInteractionSource = remember { MutableInteractionSource() }
 ) {
     Column {
         Text(label, style = MaterialTheme.typography.labelLarge)
-        Slider(value = value, onValueChange = onValueChange, valueRange = range)
+        Slider(
+            value = value,
+            onValueChange = onValueChange,
+            valueRange = range,
+            interactionSource = interactionSource
+        )
     }
 }
 
@@ -2254,8 +3020,28 @@ private fun AmLyricsWebView(
     state.onUserScroll = onUserScroll
     state.seekTo = onSeekTo
     val assetLoader = remember(context) {
+        val fontDirectory = File(context.filesDir, "lyrics-fonts")
         WebViewAssetLoader.Builder()
             .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(context))
+            .addPathHandler(
+                "/custom-font/",
+                WebViewAssetLoader.PathHandler { path ->
+                    if (!path.matches(Regex("lyrics-[a-f0-9-]+\\.(ttf|otf)"))) {
+                        null
+                    } else {
+                        val fontFile = File(fontDirectory, path)
+                        if (!fontFile.isFile) {
+                            null
+                        } else {
+                            WebResourceResponse(
+                                if (path.endsWith(".otf")) "font/otf" else "font/ttf",
+                                null,
+                                FileInputStream(fontFile)
+                            )
+                        }
+                    }
+                }
+            )
             .build()
     }
 
@@ -2348,7 +3134,12 @@ private fun AmLyricsWebView(
                         }
                     }
                 }
-                loadUrl("https://appassets.androidplatform.net/assets/am-lyrics/index.html")
+                val initialAppearance = state.appearance
+                val initialColor = android.net.Uri.encode(initialAppearance.highlightColor)
+                loadUrl(
+                    "https://appassets.androidplatform.net/assets/am-lyrics/index.html" +
+                        "?highlightColor=$initialColor&darkTheme=${initialAppearance.darkTheme}"
+                )
             }
         },
         update = { webView ->
@@ -2368,6 +3159,28 @@ private fun WebView.applyAmLyricsState(
     state: AmLyricsViewState,
     forceContent: Boolean = false
 ) {
+    if (state.sentAppearance != state.appearance) {
+        val appearance = state.appearance
+        val appearanceJson = JSONObject()
+            .put("highlightColor", appearance.highlightColor)
+            .put("glowRadius", appearance.glowRadius)
+            .put("fontSize", appearance.fontSize)
+            .put("lineSpacing", appearance.lineSpacing)
+            .put("currentLinePosition", appearance.currentLinePosition)
+            .put("autoScroll", appearance.autoScroll)
+            .put("interpolate", appearance.interpolate)
+            .put("blur", appearance.blur)
+            .put("reducedMotion", appearance.reducedMotion)
+            .put("hidePlayedLines", appearance.hidePlayedLines)
+            .put("darkTheme", appearance.darkTheme)
+            .put("customFontFileName", appearance.customFontFileName)
+        evaluateJavascript(
+            "window.amLyricsSetAppearance(${JSONObject.quote(appearanceJson.toString())})",
+            null
+        )
+        state.sentAppearance = appearance
+    }
+
     if (forceContent ||
         state.sentTtml != state.ttml ||
         state.sentSongId != state.songId ||
@@ -2388,26 +3201,6 @@ private fun WebView.applyAmLyricsState(
         state.sentTtml = state.ttml
         state.sentSongId = state.songId
         state.sentQqQrc = state.qqQrc
-    }
-
-    if (state.sentAppearance != state.appearance) {
-        val appearance = state.appearance
-        val appearanceJson = JSONObject()
-            .put("highlightColor", appearance.highlightColor)
-            .put("glowRadius", appearance.glowRadius)
-            .put("fontSize", appearance.fontSize)
-            .put("lineSpacing", appearance.lineSpacing)
-            .put("autoScroll", appearance.autoScroll)
-            .put("interpolate", appearance.interpolate)
-            .put("blur", appearance.blur)
-            .put("reducedMotion", appearance.reducedMotion)
-            .put("hidePlayedLines", appearance.hidePlayedLines)
-            .put("darkTheme", appearance.darkTheme)
-        evaluateJavascript(
-            "window.amLyricsSetAppearance(${JSONObject.quote(appearanceJson.toString())})",
-            null
-        )
-        state.sentAppearance = appearance
     }
 
     if (state.sentExternalSourceMode != state.externalSourceMode) {
@@ -2597,6 +3390,12 @@ private fun AppleLibrarySync.SongRow.toSongHitOrNull(): SongHit? {
     )
 }
 
+private fun SongHit.favoriteCatalogId(): String {
+    val row = MusicRepository.findSong("apple:$id")
+    return row?.catalogId?.takeIf(String::isNotBlank)
+        ?: id.takeUnless { it.startsWith("i.") }.orEmpty()
+}
+
 @Composable
 private fun KaraokePlaybackControls(
     song: SongHit,
@@ -2609,10 +3408,19 @@ private fun KaraokePlaybackControls(
     durationMs: Long,
     onLogin: () -> Unit,
     onTogglePlayback: () -> Unit,
+    isFavorited: Boolean?,
+    favoritePending: Boolean,
+    onToggleFavorite: () -> Unit,
     fullscreen: Boolean,
     onToggleFullscreen: () -> Unit,
+    onCollapseLyrics: () -> Unit,
     showTranslations: Boolean,
     onToggleTranslations: () -> Unit,
+    onOpenQueue: () -> Unit,
+    onNext: () -> Unit,
+    onPrevious: () -> Unit,
+    onQueueDragOffsetChange: (Float) -> Unit,
+    coverQueueDragOffset: Float,
     onSeekStart: (Long) -> Unit,
     onSeekChange: (Long) -> Unit,
     onSeekFinished: () -> Unit,
@@ -2663,13 +3471,19 @@ private fun KaraokePlaybackControls(
                             totalDrag += movement
                             previousPosition = pointer.position
                             val swipeThreshold = 72.dp.toPx()
+                            val horizontalSwipe = kotlin.math.abs(totalDrag.x) >= swipeThreshold &&
+                                kotlin.math.abs(totalDrag.x) > kotlin.math.abs(totalDrag.y)
                             val verticalSwipe = kotlin.math.abs(totalDrag.y) >= swipeThreshold &&
                                 kotlin.math.abs(totalDrag.y) > kotlin.math.abs(totalDrag.x)
-                            if (verticalSwipe && !handledSwipe) {
+                            if (horizontalSwipe && !handledSwipe) {
                                 handledSwipe = true
-                                if ((!fullscreen && totalDrag.y < 0f) ||
-                                    (fullscreen && totalDrag.y > 0f)
-                                ) {
+                                if (totalDrag.x > 0f) onNext()
+                                else onPrevious()
+                            } else if (verticalSwipe && !handledSwipe) {
+                                handledSwipe = true
+                                if (!fullscreen && totalDrag.y < 0f) {
+                                    onCollapseLyrics()
+                                } else if (fullscreen && totalDrag.y > 0f) {
                                     onToggleFullscreen()
                                 }
                             }
@@ -2735,19 +3549,69 @@ private fun KaraokePlaybackControls(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                AsyncImage(
-                    model = song.artworkUrl,
-                    contentDescription = "${song.title} 专辑封面",
-                    modifier = Modifier.size(60.dp).clip(RoundedCornerShape(19.dp))
-                )
+                Box(
+                    modifier = Modifier
+                        .size(60.dp)
+                        .clip(RoundedCornerShape(19.dp))
+                        .graphicsLayer { translationY = coverQueueDragOffset }
+                        .clickable(onClick = onTogglePlayback)
+                        .pointerInput(onOpenQueue) {
+                            var downwardDrag = 0f
+                            detectDragGesturesAfterLongPress(
+                                onDragEnd = {
+                                    if (downwardDrag >= 48.dp.toPx()) onOpenQueue()
+                                    downwardDrag = 0f
+                                    onQueueDragOffsetChange(0f)
+                                },
+                                onDragCancel = {
+                                    downwardDrag = 0f
+                                    onQueueDragOffsetChange(0f)
+                                },
+                                onDragStart = {
+                                    downwardDrag = 0f
+                                    onQueueDragOffsetChange(0f)
+                                },
+                                onDrag = { change, dragAmount ->
+                                    downwardDrag = (downwardDrag + dragAmount.y).coerceAtLeast(0f)
+                                    onQueueDragOffsetChange(downwardDrag.coerceAtMost(96.dp.toPx()))
+                                    change.consume()
+                                }
+                            )
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    if (song.artworkUrl.isNotBlank()) {
+                        AsyncImage(
+                            model = song.artworkUrl,
+                            contentDescription = "点击${if (isPlaying) "暂停" else "继续"}播放",
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    } else {
+                        Icon(
+                            Icons.Filled.MusicNote,
+                            contentDescription = "点击${if (isPlaying) "暂停" else "继续"}播放",
+                            tint = controlColor,
+                            modifier = Modifier.fillMaxSize().background(
+                                MaterialTheme.colorScheme.surfaceVariant,
+                                RoundedCornerShape(19.dp)
+                            ).padding(14.dp)
+                        )
+                    }
+                }
                 Column(modifier = Modifier.weight(1f).padding(horizontal = 12.dp)) {
-                    Text(
-                        song.title,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 17.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            song.title,
+                            modifier = Modifier.weight(1f),
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 17.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
                     Text(
                         song.artist,
                         color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.9f),
@@ -2771,22 +3635,35 @@ private fun KaraokePlaybackControls(
                     }
                 }
                 IconButton(
-                    onClick = onTogglePlayback,
-                    enabled = !preparing || playbackStatus.startsWith("无法播放"),
+                    onClick = onToggleFavorite,
+                    enabled = !favoritePending,
                     modifier = Modifier.size(48.dp)
                 ) {
-                    if (preparing) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(23.dp),
-                            strokeWidth = 2.dp,
-                            color = controlColor
-                        )
-                    } else {
+                    AnimatedContent(
+                        targetState = isFavorited == true,
+                        transitionSpec = {
+                            (scaleIn(initialScale = 0.65f) + fadeIn()) togetherWith
+                                (scaleOut(targetScale = 0.65f) + fadeOut())
+                        },
+                        label = "favoriteStar"
+                    ) { favorited ->
                         Icon(
-                            if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                            contentDescription = if (isPlaying) "暂停播放" else "继续播放",
-                            tint = controlColor,
-                            modifier = Modifier.size(32.dp)
+                            imageVector = if (favorited) {
+                                Icons.Filled.Star
+                            } else {
+                                Icons.Outlined.StarBorder
+                            },
+                            contentDescription = when (isFavorited) {
+                                true -> "已收藏，点击取消收藏"
+                                false -> "未收藏，点击收藏"
+                                null -> "收藏状态尚未确认，点击重试查询"
+                            },
+                            tint = if (favorited) {
+                                controlColor
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                            modifier = Modifier.size(30.dp)
                         )
                     }
                 }
@@ -2923,6 +3800,7 @@ private fun SettingsPage(
     cacheCount: Int,
     cacheBytes: Long,
     statusBarLyricsEnabled: Boolean,
+    lyricsFullscreenEnabled: Boolean,
     themeMode: AppThemeMode,
     useDynamicColors: Boolean,
     manualThemeSeedHex: String,
@@ -2932,7 +3810,9 @@ private fun SettingsPage(
     onDynamicColorsChange: (Boolean) -> Unit,
     onManualThemeSeedChange: (String) -> Unit,
     onStatusBarLyricsEnabledChange: (Boolean) -> Unit,
-    onOpenCache: () -> Unit
+    onLyricsFullscreenEnabledChange: (Boolean) -> Unit,
+    onOpenCache: () -> Unit,
+    onOpenFavoriteSongsProbe: () -> Unit
 ) {
     val supportsDynamicColor = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
     val manualThemeActive = !useDynamicColors
@@ -3118,6 +3998,33 @@ private fun SettingsPage(
             }
         }
         ElevatedCard(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(24.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 18.dp, vertical = 16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("歌词页全屏", fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "隐藏状态栏并让歌词内容延伸到屏幕顶部；关闭后为摄像头区域留出空间",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 3.dp)
+                        )
+                    }
+                    Switch(
+                        checked = lyricsFullscreenEnabled,
+                        onCheckedChange = onLyricsFullscreenEnabledChange
+                    )
+                }
+            }
+        }
+        ElevatedCard(
             modifier = Modifier
                 .fillMaxWidth()
                 .clickable(onClick = onLogin),
@@ -3160,6 +4067,88 @@ private fun SettingsPage(
                     color = MaterialTheme.colorScheme.primary,
                     style = MaterialTheme.typography.labelLarge
                 )
+            }
+        }
+        ElevatedCard(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable {
+                    context.startActivity(Intent(context, RadioProbeActivity::class.java))
+                },
+            shape = RoundedCornerShape(24.dp)
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 18.dp, vertical = 18.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Surface(
+                    modifier = Modifier.size(44.dp),
+                    shape = CircleShape,
+                    color = MaterialTheme.colorScheme.secondaryContainer
+                ) {
+                    Icon(
+                        Icons.Filled.MusicNote,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.secondary,
+                        modifier = Modifier.padding(10.dp)
+                    )
+                }
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(start = 14.dp)
+                ) {
+                    Text("个性电台接口测试", fontWeight = FontWeight.SemiBold)
+                    Text(
+                        "查看电台首批歌曲与续播接口响应",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 3.dp)
+                    )
+                }
+                Text("打开", color = MaterialTheme.colorScheme.primary)
+            }
+        }
+        ElevatedCard(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onOpenFavoriteSongsProbe),
+            shape = RoundedCornerShape(24.dp)
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 18.dp, vertical = 18.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Surface(
+                    modifier = Modifier.size(44.dp),
+                    shape = CircleShape,
+                    color = MaterialTheme.colorScheme.tertiaryContainer
+                ) {
+                    Icon(
+                        Icons.Filled.Star,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.tertiary,
+                        modifier = Modifier.padding(10.dp)
+                    )
+                }
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(start = 14.dp)
+                ) {
+                    Text("Apple Music 喜爱歌曲列表测试", fontWeight = FontWeight.SemiBold)
+                    Text(
+                        "列出账号歌单，并逐个测试曲目接口",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 3.dp)
+                    )
+                }
+                Text("打开", color = MaterialTheme.colorScheme.primary)
             }
         }
         ElevatedCard(
@@ -3260,9 +4249,88 @@ private fun PlaybackCacheLimitCard(
 }
 
 private const val BYTES_PER_GIGABYTE = 1024f * 1024f * 1024f
+private const val MAX_CUSTOM_FONT_BYTES = 20L * 1024L * 1024L
 
 private fun formatGigabytes(value: Float): String =
     if (value % 1f == 0f) value.toInt().toString() else "%.1f".format(Locale.US, value)
+
+@Composable
+private fun CollapsedLyricsArtwork(
+    song: SongHit,
+    positionMs: Long,
+    durationMs: Long,
+    accentColor: Color,
+    modifier: Modifier = Modifier,
+    onDrag: (Offset) -> Unit,
+    onDragFinished: () -> Unit,
+    onExpand: () -> Unit,
+) {
+    val currentOnDrag by rememberUpdatedState(onDrag)
+    val currentOnDragFinished by rememberUpdatedState(onDragFinished)
+    val currentOnExpand by rememberUpdatedState(onExpand)
+    val progress = if (durationMs > 0L) {
+        (positionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
+    } else {
+        0f
+    }
+    val trackColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.2f)
+    Box(
+        modifier = modifier
+            .size(64.dp)
+            .pointerInput(Unit) {
+                detectTapGestures(onTap = { currentOnExpand() })
+            }
+            .pointerInput(Unit) {
+                detectDragGesturesAfterLongPress(
+                    onDragEnd = { currentOnDragFinished() },
+                    onDragCancel = { currentOnDragFinished() },
+                    onDrag = { change, dragAmount ->
+                        currentOnDrag(dragAmount)
+                        change.consume()
+                    }
+                )
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        Canvas(Modifier.fillMaxSize()) {
+            val stroke = 2.dp.toPx()
+            drawArc(
+                color = trackColor,
+                startAngle = -90f,
+                sweepAngle = 360f,
+                useCenter = false,
+                style = androidx.compose.ui.graphics.drawscope.Stroke(width = stroke)
+            )
+            if (progress > 0f) {
+                drawArc(
+                    color = accentColor,
+                    startAngle = -90f,
+                    sweepAngle = 360f * progress,
+                    useCenter = false,
+                    style = androidx.compose.ui.graphics.drawscope.Stroke(width = stroke)
+                )
+            }
+        }
+        if (song.artworkUrl.isNotBlank()) {
+            AsyncImage(
+                model = song.artworkUrl,
+                contentDescription = "${song.title}，点击展开歌词",
+                modifier = Modifier.size(58.dp).clip(CircleShape)
+            )
+        } else {
+            Icon(
+                Icons.Filled.MusicNote,
+                contentDescription = "${song.title}，点击展开歌词",
+                tint = accentColor,
+                modifier = Modifier
+                    .size(58.dp)
+                    .clip(CircleShape)
+                    .background(MaterialTheme.colorScheme.surfaceVariant)
+                    .padding(14.dp)
+            )
+        }
+    }
+}
 
 @Composable
 private fun MiniPlayerCapsule(
@@ -3272,7 +4340,8 @@ private fun MiniPlayerCapsule(
     durationMs: Long,
     onOpen: () -> Unit,
     onTogglePlayback: () -> Unit,
-    onNext: () -> Unit
+    onNext: () -> Unit,
+    onPrevious: () -> Unit
 ) {
     val progress = if (durationMs > 0L) {
         (positionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
@@ -3285,6 +4354,7 @@ private fun MiniPlayerCapsule(
     Surface(
         modifier = Modifier
             .fillMaxWidth()
+            .widthIn(max = 360.dp)
             .drawWithContent {
                 drawContent()
                 val strokeWidth = 2.dp.toPx()
@@ -3343,8 +4413,25 @@ private fun MiniPlayerCapsule(
                     if (song.artworkUrl.isNotBlank()) {
                         AsyncImage(
                             model = song.artworkUrl,
-                            contentDescription = "${song.title} 专辑封面",
-                            modifier = Modifier.fillMaxSize().clip(CircleShape)
+                            contentDescription = "${song.title} 专辑封面，向右滑动切换下一首",
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .clip(CircleShape)
+                                .pointerInput(onNext) {
+                                    var horizontalDrag = 0f
+                                    detectHorizontalDragGestures(
+                                        onHorizontalDrag = { change, dragAmount ->
+                                            horizontalDrag += dragAmount
+                                            change.consume()
+                                        },
+                                        onDragEnd = {
+                                            if (horizontalDrag >= 48.dp.toPx()) onNext()
+                                            else if (horizontalDrag <= -48.dp.toPx()) onPrevious()
+                                            horizontalDrag = 0f
+                                        },
+                                        onDragCancel = { horizontalDrag = 0f }
+                                    )
+                                }
                         )
                     } else {
                         Icon(
@@ -3509,10 +4596,12 @@ private fun CacheManagerDialog(
     onRequestDelete: (AppleCache.CacheItem) -> Unit,
     onCancelDelete: () -> Unit,
     onConfirmDelete: (AppleCache.CacheItem) -> Unit,
+    onClearAll: () -> Unit,
     onTogglePinned: (AppleCache.CacheItem) -> Unit,
     onLimitChange: (Long) -> Unit,
     onDeleteLyrics: (String) -> Unit
 ) {
+    var confirmClearAll by remember { mutableStateOf(false) }
     Dialog(onDismissRequest = onDismiss) {
         AnimatedVisibility(
             visible = true,
@@ -3554,6 +4643,34 @@ private fun CacheManagerDialog(
                         TextButton(onClick = onCancelDelete) { Text("取消") }
                         TextButton(onClick = { onConfirmDelete(pendingDelete) }) {
                             Text("删除", color = MaterialTheme.colorScheme.error)
+                        }
+                    }
+                } else if (confirmClearAll) {
+                    Text(
+                        "清除所有缓存？",
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        "歌曲播放缓存和所有歌词来源的缓存都会删除。之后播放或打开歌曲时需要重新下载或获取。",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 12.dp)
+                    )
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 20.dp),
+                        horizontalArrangement = Arrangement.End
+                    ) {
+                        TextButton(onClick = { confirmClearAll = false }) { Text("取消") }
+                        TextButton(
+                            onClick = {
+                                confirmClearAll = false
+                                onClearAll()
+                            }
+                        ) {
+                            Text("全部清除", color = MaterialTheme.colorScheme.error)
                         }
                     }
                 } else {
@@ -3700,13 +4817,29 @@ private fun CacheManagerDialog(
                             }
                         }
                     }
-                    TextButton(
-                        onClick = onDismiss,
+                    Row(
                         modifier = Modifier
-                            .align(Alignment.End)
-                            .padding(top = 8.dp)
+                            .fillMaxWidth()
+                            .padding(top = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("完成")
+                        TextButton(
+                            onClick = { confirmClearAll = true },
+                            enabled = items.isNotEmpty()
+                        ) {
+                            Text(
+                                "一键清除所有缓存",
+                                color = if (items.isNotEmpty()) {
+                                    MaterialTheme.colorScheme.error
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                }
+                            )
+                        }
+                        TextButton(onClick = onDismiss) {
+                            Text("完成")
+                        }
                     }
                 }
             }

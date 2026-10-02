@@ -155,6 +155,83 @@ class AppleLyricsClient(context: Context) {
         localizeSearchResults(term, results.values.toList())
     }
 
+    suspend fun searchSongsByLyrics(
+        term: String,
+        qqMusicClient: QQMusicLyricsClient
+    ): List<SongHit> = withContext(Dispatchers.IO) {
+        ensureDeveloperToken()
+        val lyricCandidates = qqMusicClient.searchSongsByLyrics(term).take(8)
+        val matches = LinkedHashMap<String, Pair<Int, SongHit>>()
+        var firstSearchError: Exception? = null
+
+        for ((rank, candidate) in lyricCandidates.withIndex()) {
+            val query = listOf(
+                candidate.title,
+                candidate.artist.takeUnless { it == "未知艺人" }
+            ).filterNotNull().filter { it.isNotBlank() }.joinToString(" ")
+            if (query.isBlank()) continue
+            try {
+                val appleSongs = searchSongs(query)
+                val expectedTitle = normalizeSongText(candidate.title)
+                val expectedArtists = candidate.artist
+                    .split(Regex("[,/&、，;]+"))
+                    .map(::normalizeSongText)
+                    .filter { it.length > 1 }
+                for (song in appleSongs) {
+                    val actualTitle = normalizeSongText(song.title)
+                    val titleMatches = expectedTitle.isNotBlank() &&
+                        actualTitle.isNotBlank() &&
+                        (actualTitle == expectedTitle ||
+                            actualTitle.contains(expectedTitle) ||
+                            expectedTitle.contains(actualTitle))
+                    val actualArtist = normalizeSongText(song.artist)
+                    val artistMatches = actualArtist.isNotBlank() &&
+                        expectedArtists.any { artist ->
+                        actualArtist.contains(artist) || artist.contains(actualArtist)
+                    }
+                    val durationDifference = if (
+                        candidate.durationMs > 0L && song.durationMs > 0L
+                    ) {
+                        kotlin.math.abs(candidate.durationMs - song.durationMs)
+                    } else {
+                        Long.MAX_VALUE
+                    }
+                    val durationMatches = durationDifference <= 8_000L
+                    val credibleMatch =
+                        (titleMatches &&
+                            (artistMatches || durationMatches || expectedArtists.isEmpty())) ||
+                            (artistMatches && durationMatches)
+                    if (!credibleMatch) {
+                        continue
+                    }
+                    val score = (if (titleMatches) 100 else 0) +
+                        (if (artistMatches) 40 else 0) +
+                        when {
+                            durationDifference <= 2_000L -> 30
+                            durationDifference <= 8_000L -> 15
+                            else -> 0
+                        } - rank
+                    val previous = matches[song.id]
+                    if (previous == null || score > previous.first) {
+                        matches[song.id] = score to song
+                    }
+                }
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                if (firstSearchError == null) firstSearchError = error
+            }
+        }
+
+        if (matches.isEmpty() && firstSearchError != null) throw firstSearchError
+        matches.values.sortedByDescending { it.first }.map { it.second }
+    }
+
+    private fun normalizeSongText(text: String): String =
+        text.lowercase(Locale.US)
+            .replace(Regex("""\([^)]*\)|\[[^\]]*]|\{[^}]*}"""), "")
+            .replace(Regex("""[\p{P}\p{S}\s]+"""), "")
+
     private suspend fun localizeSearchResults(
         term: String,
         songs: List<SongHit>

@@ -383,6 +383,33 @@ class AppleCache(private val context: Context, private val api: AppleApi) {
         return true
     }
 
+    fun clearAllCached(): Int = synchronized(inflight) {
+        if (inflight.isNotEmpty()) {
+            throw java.io.IOException("有歌曲缓存正在下载，请下载完成后再清理")
+        }
+
+        var removed = 0
+        var failure: java.io.IOException? = null
+        dir.listFiles()?.forEach { file ->
+            if (file.isFile) {
+                if (file.delete() || !file.exists()) {
+                    removed++
+                } else {
+                    val error = java.io.IOException("无法删除缓存文件：${file.name}")
+                    if (failure == null) failure = error else failure?.addSuppressed(error)
+                }
+            }
+        }
+        entries.values.toList().forEach { entry ->
+            if (!File(dir, entry.fileName).exists()) {
+                entries.remove(entry.songId, entry)
+            }
+        }
+        persist()
+        failure?.let { throw it }
+        removed
+    }
+
     /** 目标写入路径。 */
     fun targetPathFor(songId: String): String = File(dir, fileNameFor(songId)).absolutePath
 
@@ -517,11 +544,15 @@ class AppleCache(private val context: Context, private val api: AppleApi) {
     }
 
     /** 后台预取（fire-and-forget）。 */
-    fun preload(songId: String, isLibrary: Boolean) {
+    fun preload(
+        songId: String,
+        isLibrary: Boolean,
+        metadata: SongMetadata? = null
+    ) {
         if (songId.isEmpty() || entries.containsKey(songId) || inflight.containsKey(songId)) return
         Thread {
             try {
-                ensure(songId, isLibrary)
+                ensure(songId, isLibrary, metadata = metadata)
             } catch (e: Throwable) {
                 Logx.w(TAG, "preload 失败 $songId: ${e.message}")
             }

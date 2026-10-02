@@ -22,19 +22,72 @@ class QQMusicLyricsClient {
     )
 
     suspend fun searchSongs(term: String): List<SongHit> = withContext(Dispatchers.IO) {
-        val encodedTerm = URLEncoder.encode(term, Charsets.UTF_8.name())
-        val root = JSONObject(
-            request("$SEARCH_URL?format=json&p=1&n=30&w=$encodedTerm")
-        )
+        parseSongSearch(requestSearch(term, searchType = 0))
+    }
+
+    suspend fun searchSongsByLyrics(term: String): List<SongHit> = withContext(Dispatchers.IO) {
+        val root = requestSearch(term, searchType = 7)
         if (root.optInt("code", 0) != 0) {
-            throw IllegalStateException("QQ 音乐搜索失败（错误码 ${root.optInt("code")}）")
+            throw IllegalStateException("QQ 音乐歌词搜索失败（错误码 ${root.optInt("code")}）")
         }
         val songs = root.optJSONObject("data")
-            ?.optJSONObject("song")
+            ?.optJSONObject("lyric")
             ?.optJSONArray("list")
             ?: return@withContext emptyList()
 
         buildList {
+            for (index in 0 until songs.length()) {
+                val item = songs.optJSONObject(index) ?: continue
+                val mid = item.optString("songmid").takeIf { it.isNotBlank() } ?: continue
+                val title = item.optString("songname").trim()
+                if (title.isBlank()) continue
+                val singer = item.optString("singer")
+                    .takeIf { it.isNotBlank() }
+                    ?: item.optString("content")
+                        .lineSequence()
+                        .firstOrNull()
+                        ?.let { line ->
+                            Regex("""^\s*.+?\s+-\s+(.+?)\s*(?:\([^)]*\))?\s*$""")
+                                .find(line)?.groupValues?.get(1)
+                                ?.replace(Regex("""\s*\([^)]*\)\s*$"""), "")
+                        }
+                        .orEmpty()
+                val albumMid = item.optString("albummid")
+                add(
+                    SongHit(
+                        id = mid,
+                        title = title,
+                        artist = singer.ifBlank { "未知艺人" },
+                        album = item.optString("albumname"),
+                        artworkUrl = albumMid.takeIf { it.isNotBlank() }?.let {
+                            "https://y.gtimg.cn/music/photo_new/T002R300x300M000$it.jpg"
+                        }.orEmpty(),
+                        durationMs = item.optLong("interval") * 1000L,
+                        providerSongId = item.optString("songid").takeIf { it.isNotBlank() }
+                    )
+                )
+            }
+        }.distinctBy { it.id }
+    }
+
+    private fun requestSearch(term: String, searchType: Int): JSONObject {
+        val encodedTerm = URLEncoder.encode(term, Charsets.UTF_8.name())
+        val pageSize = if (searchType == 7) 10 else 30
+        val root = JSONObject(
+            request("$SEARCH_URL?format=json&p=1&n=$pageSize&w=$encodedTerm&t=$searchType")
+        )
+        if (root.optInt("code", 0) != 0) {
+            throw IllegalStateException("QQ 音乐搜索失败（错误码 ${root.optInt("code")}）")
+        }
+        return root
+    }
+
+    private fun parseSongSearch(root: JSONObject): List<SongHit> {
+        val songs = root.optJSONObject("data")
+            ?.optJSONObject("song")
+            ?.optJSONArray("list")
+            ?: return emptyList()
+        return buildList {
             for (index in 0 until songs.length()) {
                 val song = songs.optJSONObject(index) ?: continue
                 val mid = song.optString("songmid").takeIf { it.isNotBlank() } ?: continue

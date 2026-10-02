@@ -118,6 +118,23 @@ class LyricsCache(context: Context) {
         removed
     }
 
+    suspend fun clearAll(): Int = withContext(Dispatchers.IO) {
+        var removed = 0
+        var failure: java.io.IOException? = null
+        directory.listFiles()?.forEach { file ->
+            if (file.isFile) {
+                if (file.delete() || !file.exists()) {
+                    removed++
+                } else {
+                    val error = java.io.IOException("无法删除歌词缓存文件：${file.name}")
+                    if (failure == null) failure = error else failure?.addSuppressed(error)
+                }
+            }
+        }
+        failure?.let { throw it }
+        removed
+    }
+
     private fun cacheFile(source: String, songId: String): File {
         require(source == "apple" || source == "qq") { "不支持的歌词缓存来源：$source" }
         require(songId.isNotBlank()) { "歌词缓存歌曲 ID 不能为空" }

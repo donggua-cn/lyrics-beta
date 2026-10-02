@@ -43,6 +43,9 @@ object PlaybackEngine {
     var queueIndex = -1
         private set
 
+    @Volatile
+    private var skipPendingForQueueContinuation = false
+
     /**
      * **真正在出声**的那一首。
      *
@@ -64,10 +67,8 @@ object PlaybackEngine {
     var onStateChanged: (() -> Unit)? = null
 
     /**
-     * 队列快见底时的回调（智能电台用来「续杯」）。
-     *
-     * 队列里剩余待播曲目 ≤ [QUEUE_LOW_WATER] 时触发一次；由外部决定要不要补、
-     * 补什么。普通列表播放时把它置为 null 即可。
+     * 队列快见底或用户手动切歌时的回调（智能电台用来「续杯」）。
+     * 普通列表播放时把它置为 null 即可。
      */
     var onQueueLow: ((remaining: Int) -> Unit)? = null
 
@@ -94,6 +95,17 @@ object PlaybackEngine {
         if (added > 0) {
             Logx.i(TAG, "队列续杯 +$added 首（现共 ${synchronized(queue) { queue.size }} 首）")
             onStateChanged?.invoke()
+            val pendingIndex = synchronized(queue) {
+                if (skipPendingForQueueContinuation) {
+                    skipPendingForQueueContinuation = false
+                    maxOf(queueIndex, playingIndex) + 1
+                } else {
+                    -1
+                }
+            }
+            if (pendingIndex >= 0 && pendingIndex < synchronized(queue) { queue.size }) {
+                playAt(pendingIndex)
+            }
         }
         return added
     }
@@ -353,6 +365,7 @@ object PlaybackEngine {
         synchronized(queue) {
             queue.clear()
             queue.addAll(uris)
+            skipPendingForQueueContinuation = false
         }
         // 换了队列，旧的「正在出声的那首」下标已经无意义；
         // 坏条目记录也一并清掉（换个上下文可能就好了，例如网络恢复）
@@ -409,7 +422,28 @@ object PlaybackEngine {
     fun next() {
         val n = synchronized(queue) { queue.size }
         if (n == 0) return
-        playAt(findPlayable(maxOf(queueIndex, playingIndex), 1, n))
+        val currentIndex = maxOf(queueIndex, playingIndex)
+        if (currentIndex + 1 < n) {
+            playAt(findPlayable(currentIndex, 1, n))
+            val continuation = onQueueLow
+            if (continuation != null) {
+                val remaining = queueRemaining()
+                if (remaining > QUEUE_LOW_WATER) {
+                    Logx.i(TAG, "手动切歌后主动请求电台续歌（剩余 $remaining 首）")
+                    continuation(remaining)
+                }
+            }
+            return
+        }
+        val continuation = onQueueLow
+        if (continuation != null) {
+            synchronized(queue) { skipPendingForQueueContinuation = true }
+            Logx.i(TAG, "电台队列暂无下一首，等待 Apple 续歌后跳转")
+            continuation(0)
+            onStateChanged?.invoke()
+            return
+        }
+        playAt(findPlayable(currentIndex, 1, n))
     }
 
     fun prev() {
