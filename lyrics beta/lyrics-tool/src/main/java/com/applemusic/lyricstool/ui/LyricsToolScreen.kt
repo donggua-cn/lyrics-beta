@@ -1953,6 +1953,7 @@ private fun AppearanceSwitch(
 private class AmLyricsViewState(
     var songId: String,
     var ttml: String,
+    var qqQrc: Boolean,
     var title: String,
     var artist: String,
     var album: String,
@@ -1970,6 +1971,7 @@ private class AmLyricsViewState(
     var pageReady = false
     var sentTtml: String? = null
     var sentSongId: String? = null
+    var sentQqQrc: Boolean? = null
     var sentAppearance: LyricsAppearance? = null
     var sentTranslations: Boolean? = null
     var sentExternalSourceMode: Boolean? = null
@@ -2034,6 +2036,7 @@ private fun AmLyricsWebView(
         AmLyricsViewState(
             songId = song.id,
             ttml = ttml,
+            qqQrc = fetchedLyrics.qqQrcDebugText != null,
             title = song.title,
             artist = song.artist,
             album = song.album,
@@ -2051,6 +2054,7 @@ private fun AmLyricsWebView(
     }
     state.songId = song.id
     state.ttml = ttml
+    state.qqQrc = fetchedLyrics.qqQrcDebugText != null
     state.title = song.title
     state.artist = song.artist
     state.album = song.album
@@ -2152,7 +2156,8 @@ private fun WebView.applyAmLyricsState(
 ) {
     if (forceContent ||
         state.sentTtml != state.ttml ||
-        state.sentSongId != state.songId
+        state.sentSongId != state.songId ||
+        state.sentQqQrc != state.qqQrc
     ) {
         evaluateJavascript(
             "window.amLyricsSetContent(" +
@@ -2162,11 +2167,13 @@ private fun WebView.applyAmLyricsState(
                 "${JSONObject.quote(state.album)}," +
                 "${state.durationMs}," +
                 "${JSONObject.quote(state.appearance.highlightColor)}," +
-                "${JSONObject.quote(state.songId)})",
+                "${JSONObject.quote(state.songId)}," +
+                "${state.qqQrc})",
             null
         )
         state.sentTtml = state.ttml
         state.sentSongId = state.songId
+        state.sentQqQrc = state.qqQrc
     }
 
     if (state.sentAppearance != state.appearance) {

@@ -44,6 +44,8 @@
     let sourceFetcherObserver = null;
     let sourceLookupRequest = 0;
     let activeSourceLookupRequest = 0;
+    let nativeBlurObserver = null;
+    const nativeBlurLines = new Set();
     lyrics.style.height = '100%';
     sourceFetcherHost.style.cssText =
       'position:fixed;left:-200vw;top:0;width:400px;height:700px;' +
@@ -75,12 +77,97 @@
           box-shadow: 0 0 0 1px transparent !important;
           transform: scale(0.98) !important;
         }
+        .lyrics-container.user-scrolling .lyrics-line {
+          filter: none !important;
+          opacity: 0.8 !important;
+        }
         .lyrics-syllable .char.native-motion[data-glow]::after {
           text-shadow: 0 0 var(--am-lyrics-glow-radius, 5px)
             rgb(255 255 255 / var(--char-glow-max, 0)) !important;
         }
       `;
       root.appendChild(style);
+    }
+
+    function clearQqDistanceBlur() {
+      for (const line of nativeBlurLines) {
+        line.style.removeProperty('filter');
+      }
+      nativeBlurLines.clear();
+    }
+
+    function updateQqDistanceBlur() {
+      const container = lyrics.shadowRoot?.querySelector('.lyrics-container');
+      if (
+        !nativeState?.qqQrc ||
+        !container?.classList.contains('blur-inactive-enabled') ||
+        container.classList.contains('not-focused') ||
+        container.classList.contains('user-scrolling') ||
+        container.classList.contains('touch-scrolling') ||
+        container.classList.contains('wheel-scrolling')
+      ) {
+        clearQqDistanceBlur();
+        return;
+      }
+
+      const lines = Array.from(
+        container.querySelectorAll('.lyrics-line:not(.lyrics-gap)')
+      );
+      const activeIndices = lines.flatMap((line, index) =>
+        line.classList.contains('active') || line.classList.contains('pre-active')
+          ? [index]
+          : []
+      );
+      if (activeIndices.length === 0) {
+        clearQqDistanceBlur();
+        return;
+      }
+
+      const maxBlurEm = Number.parseFloat(
+        getComputedStyle(container).getPropertyValue('--lyplus-blur-amount')
+      ) || 0.22;
+      const currentLines = new Set();
+      lines.forEach((line, index) => {
+        if (line.classList.contains('active') ||
+            line.classList.contains('pre-active') ||
+            line.classList.contains('far-line')) {
+          return;
+        }
+
+        const distance = Math.min(
+          ...activeIndices.map(activeIndex => Math.abs(index - activeIndex))
+        );
+        if (distance === 0) return;
+        const blurEm = Math.min(distance * 0.028, maxBlurEm);
+        line.style.setProperty(
+          'filter',
+          `blur(${blurEm.toFixed(3)}em)`,
+          'important'
+        );
+        currentLines.add(line);
+      });
+
+      for (const line of nativeBlurLines) {
+        if (!currentLines.has(line)) line.style.removeProperty('filter');
+      }
+      nativeBlurLines.clear();
+      currentLines.forEach(line => nativeBlurLines.add(line));
+    }
+
+    function scheduleQqDistanceBlur() {
+      if (!nativeState?.qqQrc) return;
+      lyrics.updateComplete?.then(updateQqDistanceBlur);
+    }
+
+    function observeQqDistanceBlur() {
+      if (nativeBlurObserver || !lyrics.shadowRoot) return;
+      nativeBlurObserver = new MutationObserver(scheduleQqDistanceBlur);
+      nativeBlurObserver.observe(lyrics.shadowRoot, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+        attributeFilter: ['class']
+      });
     }
 
     function disableHiddenFooterScroll() {
@@ -188,10 +275,21 @@
       });
     }
 
-    window.amLyricsSetContent = (ttml, title, artist, album, duration, color, songId) => {
+    window.amLyricsSetContent = (
+      ttml,
+      title,
+      artist,
+      album,
+      duration,
+      color,
+      songId,
+      qqQrc
+    ) => {
+      if (nativeState?.qqQrc && !qqQrc) clearQqDistanceBlur();
       nativeState = {
         ttml,
         songId: songId || nativeState?.songId,
+        qqQrc: Boolean(qqQrc),
         title,
         artist,
         album,
@@ -203,6 +301,7 @@
       if (!lyrics.isConnected || !customElements.get('am-lyrics')) return;
 
       installNativeStyles();
+      observeQqDistanceBlur();
       lyrics.ttml = ttml;
       lyrics.songTitle = title;
       lyrics.songArtist = artist;
@@ -250,6 +349,7 @@
       lyrics.noBlur = !appearance.blur;
       lyrics.reducedMotion = Boolean(appearance.reducedMotion);
       lyrics.hidePlayedLines = Boolean(appearance.hidePlayedLines);
+      scheduleQqDistanceBlur();
     };
 
     window.amLyricsSetSourceMode = (enabled, requestedId) => {
@@ -262,6 +362,7 @@
 
     window.amLyricsSetTime = (timeMs) => {
       lyrics.currentTime = Number(timeMs) || 0;
+      scheduleQqDistanceBlur();
     };
 
     lyrics.addEventListener('line-click', event => {
@@ -272,6 +373,7 @@
 
     customElements.whenDefined('am-lyrics').then(() => {
       installNativeStyles();
+      observeQqDistanceBlur();
       if (nativeState) {
         window.amLyricsSetContent(
           nativeState.ttml,
@@ -280,7 +382,8 @@
           nativeState.album,
           nativeState.duration,
           nativeState.color,
-          nativeState.songId
+          nativeState.songId,
+          nativeState.qqQrc
         );
       }
     });
