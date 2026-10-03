@@ -115,7 +115,6 @@ import androidx.compose.material.icons.filled.Sort
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.Translate
-import androidx.compose.material.icons.outlined.StarBorder
 import androidx.compose.material3.Button
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
@@ -183,6 +182,8 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.positionInWindow
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Brush
@@ -258,6 +259,7 @@ import kotlinx.coroutines.withContext
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileInputStream
+import java.security.MessageDigest
 import java.util.UUID
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
@@ -365,8 +367,101 @@ private data class HomeCollection(
     val item: ShelfItem,
     val tracks: List<AppleLibrarySync.SongRow>,
     val metadata: CollectionMetadata? = null,
-    val metadataError: String? = null
+    val metadataError: String? = null,
+    val nextTrackOffset: Int = tracks.size,
+    val totalTrackCount: Int = 0,
+    val hasMoreTracks: Boolean = false,
+    val loadingMoreTracks: Boolean = false,
+    val trackLoadError: String? = null
 )
+
+private data class LoadedCollectionTracks(
+    val rows: List<AppleLibrarySync.SongRow>,
+    val nextOffset: Int,
+    val totalCount: Int,
+    val hasMore: Boolean
+)
+
+private const val COLLECTION_TRACK_PAGE_SIZE = 20
+private const val COLLECTION_TRACK_PREFETCH_REMAINING = 6
+private const val FAVORITE_SONG_CACHE_TTL_MS = 30 * 60 * 1000L
+
+private data class FavoriteSongCacheSnapshot(
+    val songIds: Set<String>,
+    val fetchedAtMs: Long
+)
+
+private fun favoriteSongCacheAccountKey(userToken: String): String? {
+    if (userToken.isBlank()) return null
+    val digest = MessageDigest.getInstance("SHA-256")
+        .digest(userToken.toByteArray(Charsets.UTF_8))
+    return digest.joinToString("") { byte -> "%02x".format(byte) }
+}
+
+private fun isUnavailableCatalogPlaylistPage(
+    error: RuntimeException,
+    item: ShelfItem,
+    offset: Int
+): Boolean {
+    val message = error.message ?: return false
+    return !item.isLibraryPlaylist &&
+        offset > 0 &&
+        message.startsWith("HTTP 404 @ /v1/catalog/") &&
+        message.contains("/playlists/") &&
+        message.contains("/tracks?") &&
+        message.contains("offset=$offset")
+}
+
+private fun loadRemainingPlaylistTracks(
+    item: ShelfItem,
+    initialRows: List<AppleLibrarySync.SongRow>,
+    initialOffset: Int,
+    initialTotalCount: Int
+): LoadedCollectionTracks {
+    val rows = initialRows.toMutableList()
+    var nextOffset = initialOffset
+    var totalCount = initialTotalCount
+    var hasMore = true
+    var pageCount = 0
+    while (hasMore) {
+        check(pageCount < 100) { "歌单曲目过多，暂时无法一次性加载完整列表" }
+        val page = try {
+            MusicRepository.api.getRecommendedPlaylistTracks(
+                item.id,
+                item.relatedCatalogId,
+                item.isLibraryPlaylist,
+                COLLECTION_TRACK_PAGE_SIZE,
+                nextOffset
+            )
+        } catch (error: RuntimeException) {
+            if (isUnavailableCatalogPlaylistPage(error, item, nextOffset)) {
+                break
+            }
+            throw error
+        }
+        val newRows = page.items.map {
+            MusicRepository.rowOf(it).also { row -> row.isLibrary = false }
+        }
+        if (newRows.isEmpty()) {
+            break
+        }
+        rows += newRows
+        nextOffset += page.size()
+        totalCount = maxOf(totalCount, page.total)
+        hasMore = page.next.isNotBlank() ||
+            totalCount > nextOffset ||
+            page.size() == COLLECTION_TRACK_PAGE_SIZE
+        pageCount++
+    }
+    val distinctRows = rows.distinctBy { it.uri }
+    MusicRepository.registerTransient(distinctRows)
+    return LoadedCollectionTracks(
+        rows = distinctRows,
+        nextOffset = nextOffset,
+        totalCount = totalCount,
+        hasMore = false
+    )
+}
 
 private data class HomeCollectionCardTransition(
     val item: ShelfItem,
@@ -379,7 +474,10 @@ private data class PendingHomePlayback(
     val startIndex: Int = 0,
     val stationId: String? = null,
     val catalogArtistId: String? = null,
-    val shuffleArtistContinuation: Boolean = false
+    val shuffleArtistContinuation: Boolean = false,
+    val playlistContinuation: ShelfItem? = null,
+    val playlistNextOffset: Int = 0,
+    val playlistTotalCount: Int = 0
 )
 
 private data class LyricsAppearance(
@@ -565,6 +663,29 @@ internal fun LyricsToolScreen(
         val scope = rememberCoroutineScope()
         val clipboard = LocalClipboardManager.current
         val snackbar = remember { SnackbarHostState() }
+        val favoriteSongsPreferences = remember(context) {
+            context.getSharedPreferences(
+                "favorite_songs_cache",
+                android.content.Context.MODE_PRIVATE
+            )
+        }
+        val favoriteAccountKey = remember(client.userToken) {
+            favoriteSongCacheAccountKey(client.userToken)
+        }
+        val cachedFavoriteSnapshot = remember(
+            favoriteSongsPreferences,
+            favoriteAccountKey
+        ) {
+            val accountMatches = favoriteAccountKey != null &&
+                favoriteSongsPreferences.getString("account_key", null) == favoriteAccountKey
+            val ids = favoriteSongsPreferences.getStringSet("song_ids", null)?.toSet()
+            val fetchedAtMs = favoriteSongsPreferences.getLong("fetched_at_ms", 0L)
+            if (accountMatches && ids != null && fetchedAtMs > 0L) {
+                FavoriteSongCacheSnapshot(ids, fetchedAtMs)
+            } else {
+                null
+            }
+        }
         val profilePreferences = remember(context) {
             context.getSharedPreferences("user_profile", android.content.Context.MODE_PRIVATE)
         }
@@ -580,7 +701,12 @@ internal fun LyricsToolScreen(
         var selectedSong by remember { mutableStateOf<SongHit?>(null) }
         var lyricsCollapsed by remember { mutableStateOf(false) }
         var lyricsInteractionVersion by remember { mutableLongStateOf(0L) }
-        var favoritedSongIds by remember { mutableStateOf<Set<String>?>(null) }
+        var favoritedSongIds by remember(favoriteAccountKey) {
+            mutableStateOf(cachedFavoriteSnapshot?.songIds)
+        }
+        var favoriteCacheFetchedAtMs by remember(favoriteAccountKey) {
+            mutableLongStateOf(cachedFavoriteSnapshot?.fetchedAtMs ?: 0L)
+        }
         var favoriteStatusLoading by remember { mutableStateOf(false) }
         var favoritePendingSongId by remember { mutableStateOf<String?>(null) }
         var selectedPage by remember { mutableStateOf(ToolPage.Home) }
@@ -867,18 +993,33 @@ internal fun LyricsToolScreen(
         val openLogin = {
             loginLauncher.launch(Intent(context, AppleMusicLoginActivity::class.java))
         }
-        val refreshFavoriteStatus: () -> Unit = {
-            if (!favoriteStatusLoading) {
+        val refreshFavoriteStatus: (Boolean) -> Unit = { force ->
+            val cacheIsFresh = favoritedSongIds != null &&
+                System.currentTimeMillis() - favoriteCacheFetchedAtMs <
+                FAVORITE_SONG_CACHE_TTL_MS
+            if (
+                signedIn &&
+                favoriteAccountKey != null &&
+                !favoriteStatusLoading &&
+                (force || !cacheIsFresh)
+            ) {
                 scope.launch {
                     favoriteStatusLoading = true
                     try {
-                        favoritedSongIds = withContext(Dispatchers.IO) {
+                        val favoriteIds = withContext(Dispatchers.IO) {
                             MusicRepository.api.getFavoriteCatalogSongIds()
                         }
+                        val fetchedAtMs = System.currentTimeMillis()
+                        favoritedSongIds = favoriteIds
+                        favoriteCacheFetchedAtMs = fetchedAtMs
+                        favoriteSongsPreferences.edit()
+                            .putString("account_key", favoriteAccountKey)
+                            .putStringSet("song_ids", favoriteIds.toSet())
+                            .putLong("fetched_at_ms", fetchedAtMs)
+                            .apply()
                     } catch (error: CancellationException) {
                         throw error
                     } catch (error: Exception) {
-                        favoritedSongIds = null
                         snackbar.showSnackbar(
                             "无法读取 Apple Music 喜爱歌曲列表：" +
                                 (error.message ?: "请稍后重试")
@@ -890,8 +1031,19 @@ internal fun LyricsToolScreen(
             }
         }
         LaunchedEffect(signedIn, selectedSong?.id) {
-            favoritedSongIds = null
-            if (signedIn && selectedSong != null) refreshFavoriteStatus()
+            if (signedIn && selectedSong != null) refreshFavoriteStatus(false)
+        }
+        LaunchedEffect(signedIn, favoriteAccountKey) {
+            if (!signedIn || favoriteAccountKey == null) {
+                favoritedSongIds = null
+                favoriteCacheFetchedAtMs = 0L
+                return@LaunchedEffect
+            }
+            refreshFavoriteStatus(false)
+            while (true) {
+                delay(FAVORITE_SONG_CACHE_TTL_MS)
+                refreshFavoriteStatus(true)
+            }
         }
         val toggleSongFavorite: (SongHit) -> Unit = { song ->
             val catalogId = song.favoriteCatalogId()
@@ -900,7 +1052,7 @@ internal fun LyricsToolScreen(
             } else if (favoritePendingSongId == null) {
                 val knownFavoriteIds = favoritedSongIds
                 if (knownFavoriteIds == null) {
-                    refreshFavoriteStatus()
+                    refreshFavoriteStatus(true)
                 } else {
                     val favorite = catalogId !in knownFavoriteIds
                     scope.launch {
@@ -913,6 +1065,16 @@ internal fun LyricsToolScreen(
                                 knownFavoriteIds + catalogId
                             } else {
                                 knownFavoriteIds - catalogId
+                            }
+                            val updatedFavoriteIds = favoritedSongIds.orEmpty()
+                            val updatedAtMs = System.currentTimeMillis()
+                            favoriteCacheFetchedAtMs = updatedAtMs
+                            favoriteAccountKey?.let { accountKey ->
+                                favoriteSongsPreferences.edit()
+                                    .putString("account_key", accountKey)
+                                    .putStringSet("song_ids", updatedFavoriteIds.toSet())
+                                    .putLong("fetched_at_ms", updatedAtMs)
+                                    .apply()
                             }
                             snackbar.showSnackbar(
                                 if (favorite) "已收藏到 Apple Music 资料库"
@@ -1015,9 +1177,9 @@ internal fun LyricsToolScreen(
                         Log.w("CatalogCollectionPage", "无法读取《${item.title}》的完整详情", error)
                         null to (error.message ?: "完整详情暂不可用")
                     }
-                    val tracks = withContext(Dispatchers.IO) {
+                    val loadedTracks = withContext(Dispatchers.IO) {
                         if (item.isAlbum) {
-                            MusicRepository.api.getRecommendedAlbumTracks(
+                            val rows = MusicRepository.api.getRecommendedAlbumTracks(
                                 albumId = item.id,
                                 relatedCatalogId = item.relatedCatalogId,
                                 isLibraryAlbum = item.type.contains("library", ignoreCase = true),
@@ -1025,50 +1187,53 @@ internal fun LyricsToolScreen(
                                 catalogStorefront = item.catalogStorefront.ifBlank {
                                     MusicRepository.api.storefront
                                 }
+                            ).map { MusicRepository.rowOf(it).also { row -> row.isLibrary = false } }
+                            LoadedCollectionTracks(
+                                rows = rows,
+                                nextOffset = rows.size,
+                                totalCount = rows.size,
+                                hasMore = false
                             )
-                                .map { MusicRepository.rowOf(it).also { row -> row.isLibrary = false } }
                         } else if (item.isPlaylist) {
-                            val rows = ArrayList<AppleLibrarySync.SongRow>()
-                            var offset = 0
-                            var expectedTotal = 0
-                            var pages = 0
-                            do {
-                                val page = MusicRepository.api.getRecommendedPlaylistTracks(
-                                    item.id,
-                                    item.relatedCatalogId,
-                                    item.isLibraryPlaylist,
-                                    100,
-                                    offset
-                                )
-                                expectedTotal = maxOf(expectedTotal, page.total)
-                                rows.addAll(
-                                    page.items.map {
-                                        MusicRepository.rowOf(it).also { row ->
-                                            row.isLibrary = false
-                                        }
-                                    }
-                                )
-                                offset += page.size()
-                                pages++
-                                if (page.size() < 100 || (expectedTotal > 0 && offset >= expectedTotal)) {
-                                    break
+                            val page = MusicRepository.api.getRecommendedPlaylistTracks(
+                                item.id,
+                                item.relatedCatalogId,
+                                item.isLibraryPlaylist,
+                                COLLECTION_TRACK_PAGE_SIZE,
+                                0
+                            )
+                            val rows = page.items.map {
+                                MusicRepository.rowOf(it).also { row ->
+                                    row.isLibrary = false
                                 }
-                            } while (pages < 20)
-                            check(expectedTotal == 0 || rows.size >= expectedTotal) {
-                                "歌单曲目尚未完整加载（已加载 ${rows.size} 首，共 $expectedTotal 首）"
                             }
-                            rows
+                            val totalCount = maxOf(page.total, item.trackCount)
+                            val hasMore = page.next.isNotBlank() ||
+                                totalCount > page.size() ||
+                                page.size() == COLLECTION_TRACK_PAGE_SIZE
+                            LoadedCollectionTracks(
+                                rows = rows,
+                                nextOffset = page.size(),
+                                totalCount = totalCount,
+                                hasMore = hasMore
+                            )
                         } else {
                             error("不支持打开此类型的内容：${item.type}")
                         }
                     }
-                    check(tracks.isNotEmpty()) { "Apple Music 没有返回《${item.title}》的曲目" }
-                    MusicRepository.registerTransient(tracks)
+                    check(loadedTracks.rows.isNotEmpty()) {
+                        "Apple Music 没有返回《${item.title}》的曲目"
+                    }
+                    MusicRepository.registerTransient(loadedTracks.rows)
+                    if (selectedCollection?.item?.id != item.id) return@launch
                     selectedCollection = HomeCollection(
                         item = item,
-                        tracks = tracks,
+                        tracks = loadedTracks.rows,
                         metadata = metadataResult.first,
-                        metadataError = metadataResult.second
+                        metadataError = metadataResult.second,
+                        nextTrackOffset = loadedTracks.nextOffset,
+                        totalTrackCount = loadedTracks.totalCount,
+                        hasMoreTracks = loadedTracks.hasMore
                     )
                 } catch (error: CancellationException) {
                     throw error
@@ -1077,6 +1242,144 @@ internal fun LyricsToolScreen(
                 } finally {
                     collectionLoading = false
                 }
+            }
+        }
+
+        fun loadMoreCollectionTracks() {
+            val collection = selectedCollection ?: return
+            if (
+                !collection.item.isPlaylist ||
+                !collection.hasMoreTracks ||
+                collection.loadingMoreTracks
+            ) {
+                return
+            }
+            val item = collection.item
+            val offset = collection.nextTrackOffset
+            selectedCollection = collection.copy(
+                loadingMoreTracks = true,
+                trackLoadError = null
+            )
+            scope.launch {
+                try {
+                    val page = withContext(Dispatchers.IO) {
+                        MusicRepository.api.getRecommendedPlaylistTracks(
+                            item.id,
+                            item.relatedCatalogId,
+                            item.isLibraryPlaylist,
+                            COLLECTION_TRACK_PAGE_SIZE,
+                            offset
+                        )
+                    }
+                    val current = selectedCollection
+                        ?.takeIf { it.item.id == item.id && it.item.type == item.type }
+                        ?: return@launch
+                    val newRows = page.items.map {
+                        MusicRepository.rowOf(it).also { row ->
+                            row.isLibrary = false
+                        }
+                    }
+                    MusicRepository.registerTransient(newRows)
+                    val nextOffset = offset + page.size()
+                    val totalCount = maxOf(current.totalTrackCount, page.total)
+                    selectedCollection = current.copy(
+                        tracks = (current.tracks + newRows).distinctBy { it.uri },
+                        nextTrackOffset = nextOffset,
+                        totalTrackCount = totalCount,
+                        hasMoreTracks = newRows.isNotEmpty() && (
+                            page.next.isNotBlank() ||
+                                totalCount > nextOffset ||
+                                page.size() == COLLECTION_TRACK_PAGE_SIZE
+                            ),
+                        loadingMoreTracks = false
+                    )
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: RuntimeException) {
+                    val current = selectedCollection
+                        ?.takeIf { it.item.id == item.id && it.item.type == item.type }
+                        ?: return@launch
+                    if (isUnavailableCatalogPlaylistPage(error, item, offset)) {
+                        selectedCollection = current.copy(
+                            hasMoreTracks = false,
+                            loadingMoreTracks = false
+                        )
+                    } else {
+                        Log.e(
+                            "CatalogCollectionPage",
+                            "加载《${item.title}》后续曲目失败",
+                            error
+                        )
+                        selectedCollection = current.copy(
+                            loadingMoreTracks = false,
+                            trackLoadError = error.message ?: "加载更多曲目失败"
+                        )
+                    }
+                } catch (error: Exception) {
+                    val current = selectedCollection
+                        ?.takeIf { it.item.id == item.id && it.item.type == item.type }
+                        ?: return@launch
+                    Log.e(
+                        "CatalogCollectionPage",
+                        "加载《${item.title}》后续曲目失败",
+                        error
+                    )
+                    selectedCollection = current.copy(
+                        loadingMoreTracks = false,
+                        trackLoadError = error.message ?: "加载更多曲目失败"
+                    )
+                }
+            }
+        }
+
+        suspend fun loadAllCollectionTracks(
+            collection: HomeCollection
+        ): List<AppleLibrarySync.SongRow> {
+            if (!collection.item.isPlaylist || !collection.hasMoreTracks) {
+                return collection.tracks
+            }
+            check(!collection.loadingMoreTracks) { "曲目正在加载，请稍后重试" }
+            selectedCollection = collection.copy(
+                loadingMoreTracks = true,
+                trackLoadError = null
+            )
+            return try {
+                val loaded = withContext(Dispatchers.IO) {
+                    loadRemainingPlaylistTracks(
+                        collection.item,
+                        collection.tracks,
+                        collection.nextTrackOffset,
+                        collection.totalTrackCount
+                    )
+                }
+                selectedCollection
+                    ?.takeIf { it.item.id == collection.item.id }
+                    ?.let { current ->
+                        selectedCollection = current.copy(
+                            tracks = loaded.rows,
+                            nextTrackOffset = loaded.nextOffset,
+                            totalTrackCount = loaded.totalCount,
+                            hasMoreTracks = loaded.hasMore,
+                            loadingMoreTracks = false,
+                            trackLoadError = null
+                        )
+                    }
+                loaded.rows
+            } catch (error: CancellationException) {
+                selectedCollection
+                    ?.takeIf { it.item.id == collection.item.id }
+                    ?.let { selectedCollection = it.copy(loadingMoreTracks = false) }
+                throw error
+            } catch (error: Exception) {
+                selectedCollection
+                    ?.takeIf { it.item.id == collection.item.id }
+                    ?.let {
+                        selectedCollection = it.copy(
+                            loadingMoreTracks = false,
+                            trackLoadError = error.message ?: "加载完整歌单失败"
+                        )
+                    }
+                throw error
             }
         }
 
@@ -1634,6 +1937,98 @@ internal fun LyricsToolScreen(
                                     }
                                 }
                                 PlaybackEngine.onQueueLow = artistQueueContinuation
+                            }
+                            request.playlistContinuation?.let { playlist ->
+                                var nextOffset = request.playlistNextOffset
+                                var expectedTotal = request.playlistTotalCount
+                                var requestInFlight = false
+                                var hasMore = true
+                                lateinit var playlistQueueContinuation: (Int) -> Unit
+                                playlistQueueContinuation = { remaining ->
+                                    if (remaining < 5 && hasMore && !requestInFlight) {
+                                        requestInFlight = true
+                                        scope.launch {
+                                            try {
+                                                val nextPage = withContext(Dispatchers.IO) {
+                                                    MusicRepository.api.getRecommendedPlaylistTracks(
+                                                        playlist.id,
+                                                        playlist.relatedCatalogId,
+                                                        playlist.isLibraryPlaylist,
+                                                        COLLECTION_TRACK_PAGE_SIZE,
+                                                        nextOffset
+                                                    )
+                                                }
+                                                if (
+                                                    PlaybackEngine.onQueueLow !==
+                                                    playlistQueueContinuation
+                                                ) {
+                                                    return@launch
+                                                }
+                                                val nextTracks = nextPage.items.map {
+                                                    MusicRepository.rowOf(it).also { row ->
+                                                        row.isLibrary = false
+                                                    }
+                                                }
+                                                if (nextTracks.isEmpty()) {
+                                                    hasMore = false
+                                                    PlaybackEngine.onQueueLow = null
+                                                    return@launch
+                                                }
+                                                MusicRepository.registerTransient(nextTracks)
+                                                PlaybackEngine.appendToQueue(
+                                                    nextTracks.map { it.uri }
+                                                )
+                                                nextOffset += nextPage.size()
+                                                expectedTotal = maxOf(
+                                                    expectedTotal,
+                                                    nextPage.total
+                                                )
+                                                hasMore = nextPage.next.isNotBlank() ||
+                                                    expectedTotal > nextOffset ||
+                                                    nextPage.size() == COLLECTION_TRACK_PAGE_SIZE
+                                                if (!hasMore) {
+                                                    PlaybackEngine.onQueueLow = null
+                                                }
+                                            } catch (error: CancellationException) {
+                                                throw error
+                                            } catch (error: RuntimeException) {
+                                                if (
+                                                    PlaybackEngine.onQueueLow ===
+                                                    playlistQueueContinuation &&
+                                                    isUnavailableCatalogPlaylistPage(
+                                                        error,
+                                                        playlist,
+                                                        nextOffset
+                                                    )
+                                                ) {
+                                                    hasMore = false
+                                                    PlaybackEngine.onQueueLow = null
+                                                } else if (
+                                                    PlaybackEngine.onQueueLow ===
+                                                    playlistQueueContinuation
+                                                ) {
+                                                    snackbar.showSnackbar(
+                                                        error.message
+                                                            ?: "无法继续加载歌单曲目"
+                                                    )
+                                                }
+                                            } catch (error: Exception) {
+                                                if (
+                                                    PlaybackEngine.onQueueLow ===
+                                                    playlistQueueContinuation
+                                                ) {
+                                                    snackbar.showSnackbar(
+                                                        error.message
+                                                            ?: "无法继续加载歌单曲目"
+                                                    )
+                                                }
+                                            } finally {
+                                                requestInFlight = false
+                                            }
+                                        }
+                                    }
+                                }
+                                PlaybackEngine.onQueueLow = playlistQueueContinuation
                             }
                             PlaybackEngine.playQueue(tracks.map { it.uri }, 0)
                         } else {
@@ -2684,11 +3079,6 @@ internal fun LyricsToolScreen(
                                         cachedLyricsItems = lyricsCache.cachedItems()
                                         cacheManagerOpen = true
                                     }
-                                },
-                                onOpenFavoriteSongsProbe = {
-                                    context.startActivity(
-                                        Intent(context, FavoriteSongsProbeActivity::class.java)
-                                    )
                                 }
                             )
                         } else if (page == ToolPage.Home && selectedSong == null) {
@@ -2917,25 +3307,52 @@ internal fun LyricsToolScreen(
                                         PendingHomePlayback(
                                             title = collection.item.title,
                                             tracks = collection.tracks,
-                                            startIndex = index
+                                            startIndex = index,
+                                            playlistContinuation = collection.item.takeIf {
+                                                it.isPlaylist && collection.hasMoreTracks
+                                            },
+                                            playlistNextOffset = collection.nextTrackOffset,
+                                            playlistTotalCount = collection.totalTrackCount
                                         )
                                     )
                                 },
                                 onShuffle = {
                                     val collection = selectedCollection ?: return@CatalogCollectionPage
-                                    requestHomePlayback(
-                                        PendingHomePlayback(
-                                            title = collection.item.title,
-                                            tracks = collection.tracks.shuffled()
-                                        )
-                                    )
+                                    scope.launch {
+                                        try {
+                                            val tracks = loadAllCollectionTracks(collection)
+                                            requestHomePlayback(
+                                                PendingHomePlayback(
+                                                    title = collection.item.title,
+                                                    tracks = tracks.shuffled()
+                                                )
+                                            )
+                                        } catch (error: CancellationException) {
+                                            throw error
+                                        } catch (error: Exception) {
+                                            snackbar.showSnackbar(
+                                                error.message ?: "无法完整加载歌单曲目"
+                                            )
+                                        }
+                                    }
                                 },
+                                onLoadMoreTracks = ::loadMoreCollectionTracks,
                                 onDownload = {
                                     val collection = selectedCollection ?: return@CatalogCollectionPage
                                     scope.launch {
+                                        val tracks = try {
+                                            loadAllCollectionTracks(collection)
+                                        } catch (error: CancellationException) {
+                                            throw error
+                                        } catch (error: Exception) {
+                                            snackbar.showSnackbar(
+                                                error.message ?: "无法完整加载歌单曲目"
+                                            )
+                                            return@launch
+                                        }
                                         var completed = 0
                                         val failures = mutableListOf<String>()
-                                        collection.tracks.forEach { row ->
+                                        tracks.forEach { row ->
                                             try {
                                                 withContext(Dispatchers.IO) {
                                                     val songId = row.appleId.ifBlank { row.catalogId }
@@ -3569,6 +3986,7 @@ private fun CatalogCollectionPage(
     error: String?,
     onBack: () -> Unit,
     onSearch: () -> Unit,
+    onLoadMoreTracks: () -> Unit,
     onPlayTrack: (Int) -> Unit,
     onShuffle: () -> Unit,
     onDownload: () -> Unit,
@@ -3734,6 +4152,40 @@ private fun CatalogCollectionPage(
                 if (sortedByTitle) collection.tracks.sortedBy { it.title.lowercase() }
                 else collection.tracks
             }
+            val latestOnLoadMoreTracks = rememberUpdatedState(onLoadMoreTracks)
+            LaunchedEffect(
+                collection.item.id,
+                displayedTracks.size,
+                collection.hasMoreTracks,
+                collection.loadingMoreTracks,
+                collection.trackLoadError
+            ) {
+                if (
+                    !collection.hasMoreTracks ||
+                    collection.loadingMoreTracks ||
+                    collection.trackLoadError != null ||
+                    displayedTracks.isEmpty()
+                ) {
+                    return@LaunchedEffect
+                }
+                snapshotFlow {
+                    listState.layoutInfo.visibleItemsInfo
+                        .mapNotNull { it.key as? String }
+                        .lastOrNull { it.startsWith("collection-track:") }
+                }.collectLatest { lastVisibleTrackKey ->
+                    val lastVisibleTrackIndex = lastVisibleTrackKey?.let { visibleKey ->
+                        displayedTracks.indexOfFirst {
+                            "collection-track:${it.uri}" == visibleKey
+                        }
+                    } ?: -1
+                    if (
+                        lastVisibleTrackIndex >=
+                        displayedTracks.size - COLLECTION_TRACK_PREFETCH_REMAINING
+                    ) {
+                        latestOnLoadMoreTracks.value()
+                    }
+                }
+            }
             Box(modifier = Modifier.fillMaxSize().background(animatedPageBackground)) {
                 AsyncImage(
                     model = artworkUrl,
@@ -3846,7 +4298,8 @@ private fun CatalogCollectionPage(
                                         )
                                     )
                                 }
-                                val count = metadata?.trackCount?.takeIf { it > 0 }
+                                val count = collection.totalTrackCount.takeIf { it > 0 }
+                                    ?: metadata?.trackCount?.takeIf { it > 0 }
                                     ?: collection.item.trackCount.takeIf { it > 0 }
                                     ?: collection.tracks.size
                                 val date = metadata?.updatedAt.orEmpty()
@@ -3946,7 +4399,10 @@ private fun CatalogCollectionPage(
                             )
                         }
                     }
-                    itemsIndexed(displayedTracks, key = { _, row -> row.uri }) { index, row ->
+                    itemsIndexed(
+                        displayedTracks,
+                        key = { _, row -> "collection-track:${row.uri}" }
+                    ) { index, row ->
                         HomeCollectionTrackRow(
                             track = row,
                             index = index,
@@ -3963,6 +4419,28 @@ private fun CatalogCollectionPage(
                                 onPlayTrack(actualIndex.coerceAtLeast(0))
                             }
                         )
+                    }
+                    if (collection.hasMoreTracks) {
+                        item(key = "collection-track-pagination") {
+                            when {
+                                collection.loadingMoreTracks -> Box(
+                                    Modifier.fillMaxWidth().padding(20.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    CircularProgressIndicator(color = animatedAccentColor)
+                                }
+                                collection.trackLoadError != null -> TextButton(
+                                    onClick = onLoadMoreTracks,
+                                    modifier = Modifier.fillMaxWidth().padding(12.dp)
+                                ) {
+                                    Text(
+                                        "加载失败，点按重试：${collection.trackLoadError}",
+                                        color = Color(0xFFFFD18A)
+                                    )
+                                }
+                                else -> Spacer(Modifier.height(8.dp))
+                            }
+                        }
                     }
                 }
                 Row(
@@ -4480,7 +4958,7 @@ private fun MusicHomePage(
                             AsyncImage(
                                 model = profileAvatarUri,
                                 contentDescription = "账户与设置",
-                                modifier = Modifier.size(26.dp).clip(CircleShape),
+                                modifier = Modifier.size(46.dp).clip(CircleShape),
                                 contentScale = ContentScale.Crop
                             )
                         }
@@ -6504,23 +6982,20 @@ private fun KaraokePlaybackControls(
                         },
                         label = "favoriteStar"
                     ) { favorited ->
-                        Icon(
-                            imageVector = if (favorited) {
-                                Icons.Filled.Star
-                            } else {
-                                Icons.Outlined.StarBorder
-                            },
-                            contentDescription = when (isFavorited) {
-                                true -> "已收藏，点击取消收藏"
-                                false -> "未收藏，点击收藏"
-                                null -> "收藏状态尚未确认，点击重试查询"
-                            },
-                            tint = if (favorited) {
+                        ArtistFavoriteStar(
+                            filled = favorited,
+                            color = if (favorited) {
                                 controlColor
                             } else {
                                 MaterialTheme.colorScheme.onSurfaceVariant
                             },
-                            modifier = Modifier.size(30.dp)
+                            modifier = Modifier.size(30.dp).semantics {
+                                contentDescription = when (isFavorited) {
+                                    true -> "已收藏，点击取消收藏"
+                                    false -> "未收藏，点击收藏"
+                                    null -> "收藏状态尚未确认，点击重试查询"
+                                }
+                            }
                         )
                     }
                 }
@@ -6671,8 +7146,7 @@ private fun SettingsPage(
     onManualThemeSeedChange: (String) -> Unit,
     onStatusBarLyricsEnabledChange: (Boolean) -> Unit,
     onLyricsFullscreenEnabledChange: (Boolean) -> Unit,
-    onOpenCache: () -> Unit,
-    onOpenFavoriteSongsProbe: () -> Unit
+    onOpenCache: () -> Unit
 ) {
     val supportsDynamicColor = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
     val manualThemeActive = !useDynamicColors
@@ -6981,88 +7455,6 @@ private fun SettingsPage(
                     color = MaterialTheme.colorScheme.primary,
                     style = MaterialTheme.typography.labelLarge
                 )
-            }
-        }
-        ElevatedCard(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clickable {
-                    context.startActivity(Intent(context, RadioProbeActivity::class.java))
-                },
-            shape = RoundedCornerShape(24.dp)
-        ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 18.dp, vertical = 18.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Surface(
-                    modifier = Modifier.size(44.dp),
-                    shape = CircleShape,
-                    color = MaterialTheme.colorScheme.secondaryContainer
-                ) {
-                    Icon(
-                        Icons.Filled.MusicNote,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.secondary,
-                        modifier = Modifier.padding(10.dp)
-                    )
-                }
-                Column(
-                    modifier = Modifier
-                        .weight(1f)
-                        .padding(start = 14.dp)
-                ) {
-                    Text("个性电台接口测试", fontWeight = FontWeight.SemiBold)
-                    Text(
-                        "查看电台首批歌曲与续播接口响应",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(top = 3.dp)
-                    )
-                }
-                Text("打开", color = MaterialTheme.colorScheme.primary)
-            }
-        }
-        ElevatedCard(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clickable(onClick = onOpenFavoriteSongsProbe),
-            shape = RoundedCornerShape(24.dp)
-        ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 18.dp, vertical = 18.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Surface(
-                    modifier = Modifier.size(44.dp),
-                    shape = CircleShape,
-                    color = MaterialTheme.colorScheme.tertiaryContainer
-                ) {
-                    Icon(
-                        Icons.Filled.Star,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.tertiary,
-                        modifier = Modifier.padding(10.dp)
-                    )
-                }
-                Column(
-                    modifier = Modifier
-                        .weight(1f)
-                        .padding(start = 14.dp)
-                ) {
-                    Text("Apple Music 喜爱歌曲列表测试", fontWeight = FontWeight.SemiBold)
-                    Text(
-                        "列出账号歌单，并逐个测试曲目接口",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(top = 3.dp)
-                    )
-                }
-                Text("打开", color = MaterialTheme.colorScheme.primary)
             }
         }
         ElevatedCard(

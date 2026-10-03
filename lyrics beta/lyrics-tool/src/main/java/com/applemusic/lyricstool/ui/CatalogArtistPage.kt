@@ -55,10 +55,12 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.animation.animateColorAsState
@@ -105,8 +107,6 @@ import coil.compose.AsyncImage
 import coil.imageLoader
 import coil.request.ImageRequest
 import coil.request.SuccessResult
-import com.applemusic.lyricstool.BuildConfig
-import kotlinx.coroutines.flow.distinctUntilChanged
 import com.applemusic.android.apple.AppleAlbum
 import com.applemusic.android.apple.AppleArtist
 import com.applemusic.android.apple.AppleArtistPage
@@ -196,28 +196,7 @@ internal fun CatalogArtistPage(
                 recyclerState.firstVisibleItemKey == "artist-hero"
         }
     }
-    LaunchedEffect(page?.artist?.id, recyclerState) {
-        if (!BuildConfig.DEBUG || page == null) return@LaunchedEffect
-        snapshotFlow {
-            val visibleSummary =
-                "artist=${page.artist.id} " +
-                    "first=${recyclerState.firstVisibleItemPosition}:" +
-                    "${recyclerState.firstVisibleItemKey} " +
-                    "last=${recyclerState.lastVisibleItemKey}"
-            recyclerState.isScrollInProgress to visibleSummary
-        }.distinctUntilChanged().collect { (scrolling, visibleItems) ->
-            ArtistScrollDiagnostics.isScrolling = scrolling
-            ArtistScrollDiagnostics.visibleItems = visibleItems
-        }
-    }
-    DisposableEffect(page?.artist?.id) {
-        onDispose {
-            if (BuildConfig.DEBUG) {
-                ArtistScrollDiagnostics.isScrolling = false
-                ArtistScrollDiagnostics.visibleItems = "not-on-artist-page"
-            }
-        }
-    }
+    val latestHeroFocused = rememberUpdatedState(heroVisible)
     val context = LocalContext.current
     val imageLoader = remember(context) { context.imageLoader }
     var pageBackground by remember(page?.artist?.id) { mutableStateOf(Color(0xFF373739)) }
@@ -235,6 +214,9 @@ internal fun CatalogArtistPage(
     val artworkUrl = page?.artist?.motionPreviewUrl
         ?.takeIf(String::isNotBlank)
         ?: page?.artist?.artworkUrl.orEmpty()
+    val artistVideoPositionMs = remember(page?.artist?.id, artworkUrl) {
+        mutableLongStateOf(0L)
+    }
     val artistColors = darkColorScheme(
         primary = animatedPageAccent,
         background = animatedPageBackground,
@@ -269,8 +251,9 @@ internal fun CatalogArtistPage(
                     ArtistHeroSection(
                         artist = page.artist,
                         artworkUrl = artworkUrl,
+                        videoPositionMs = artistVideoPositionMs,
                         heroHeight = heroHeight,
-                        isFocused = heroVisible && !recyclerState.isScrollInProgress,
+                        isFocused = latestHeroFocused.value,
                         isFavorite = isArtistFavorite,
                         savePending = artistSavePending,
                         infoDialogOpen = infoDialogOpen,
@@ -611,6 +594,7 @@ internal fun CatalogArtistPage(
 private fun ArtistHeroSection(
 artist: AppleArtist,
 artworkUrl: String,
+videoPositionMs: androidx.compose.runtime.MutableLongState,
 heroHeight: Dp,
 isFocused: Boolean,
 isFavorite: Boolean?,
@@ -623,6 +607,7 @@ Box(Modifier.fillMaxWidth().height(heroHeight)) {
     AmbientArtistArtwork(
         previewUrl = artworkUrl,
         videoUrl = artist.motionVideoUrl,
+        playbackPositionMs = videoPositionMs,
         isFocused = isFocused,
         modifier = Modifier.fillMaxSize(),
         contentScale = ContentScale.Crop
@@ -1268,9 +1253,10 @@ private fun artistShelfArtworkUrl(url: String, size: Int): String {
 }
 
 @Composable
-private fun ArtistFavoriteStar(
+internal fun ArtistFavoriteStar(
     filled: Boolean,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    color: Color = Color.White
 ) {
     Canvas(modifier) {
         val center = Offset(size.width / 2f, size.height / 2f)
@@ -1316,7 +1302,7 @@ private fun ArtistFavoriteStar(
         }
         drawPath(
             path = path,
-            color = Color.White,
+            color = color,
             style = if (filled) {
                 Fill
             } else {
@@ -1334,18 +1320,39 @@ private fun ArtistFavoriteStar(
 private fun AmbientArtistArtwork(
     previewUrl: String,
     videoUrl: String,
+    playbackPositionMs: androidx.compose.runtime.MutableLongState,
     isFocused: Boolean,
     modifier: Modifier,
     contentScale: ContentScale
 ) {
     val context = LocalContext.current
+    var player by remember(context, videoUrl) { mutableStateOf<ExoPlayer?>(null) }
+    var textureView by remember(videoUrl) { mutableStateOf<TextureView?>(null) }
+    var layoutChangeListener by remember(videoUrl) {
+        mutableStateOf<android.view.View.OnLayoutChangeListener?>(null)
+    }
+    var renderedFirstFrame by remember(videoUrl) { mutableStateOf(false) }
     var playbackEnabled by remember(videoUrl) { mutableStateOf(false) }
     LaunchedEffect(videoUrl, isFocused) {
         playbackEnabled = false
-        if (isFocused && videoUrl.startsWith("https://", ignoreCase = true)) {
-            delay(300)
-            playbackEnabled = true
+        if (!isFocused || !videoUrl.startsWith("https://", ignoreCase = true)) {
+            return@LaunchedEffect
         }
+        delay(300)
+        if (player == null) {
+            player = ExoPlayer.Builder(context.applicationContext).build().apply {
+                volume = 0f
+                repeatMode = Player.REPEAT_MODE_ONE
+                videoScalingMode = C.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING
+                setMediaItem(MediaItem.fromUri(videoUrl))
+                prepare()
+                seekTo(playbackPositionMs.longValue.coerceAtLeast(0L))
+            }
+        }
+        playbackEnabled = true
+    }
+    SideEffect {
+        player?.playWhenReady = isFocused && playbackEnabled
     }
     Box(modifier = modifier.clip(androidx.compose.ui.graphics.RectangleShape)) {
         AsyncImage(
@@ -1354,20 +1361,9 @@ private fun AmbientArtistArtwork(
             modifier = Modifier.fillMaxSize(),
             contentScale = contentScale
         )
-        if (playbackEnabled) {
-            val player = remember(context, videoUrl) {
-                ExoPlayer.Builder(context.applicationContext).build().apply {
-                    volume = 0f
-                    repeatMode = Player.REPEAT_MODE_ONE
-                    videoScalingMode = C.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING
-                }
-            }
-            var textureView by remember(player) { mutableStateOf<TextureView?>(null) }
-            var layoutChangeListener by remember(player) {
-                mutableStateOf<android.view.View.OnLayoutChangeListener?>(null)
-            }
-            var renderedFirstFrame by remember(videoUrl) { mutableStateOf(false) }
-            DisposableEffect(player, videoUrl) {
+        val activePlayer = player
+        if (activePlayer != null) {
+            DisposableEffect(activePlayer, videoUrl) {
                 val listener = object : Player.Listener {
                     override fun onRenderedFirstFrame() {
                         renderedFirstFrame = true
@@ -1381,17 +1377,17 @@ private fun AmbientArtistArtwork(
                         Log.w("CatalogArtistPage", "艺人动态封面播放失败", error)
                     }
                 }
-                player.addListener(listener)
-                player.setMediaItem(MediaItem.fromUri(videoUrl))
-                player.prepare()
-                player.playWhenReady = true
+                activePlayer.addListener(listener)
                 onDispose {
-                    player.removeListener(listener)
+                    playbackPositionMs.longValue =
+                        activePlayer.currentPosition.coerceAtLeast(0L)
+                    activePlayer.playWhenReady = false
+                    activePlayer.removeListener(listener)
                     textureView?.let { view ->
                         layoutChangeListener?.let(view::removeOnLayoutChangeListener)
-                        player.clearVideoTextureView(view)
+                        activePlayer.clearVideoTextureView(view)
                     }
-                    player.release()
+                    activePlayer.release()
                     textureView = null
                     layoutChangeListener = null
                 }
@@ -1402,11 +1398,14 @@ private fun AmbientArtistArtwork(
                         textureView = view
                         val listener = android.view.View.OnLayoutChangeListener {
                                 changedView, _, _, _, _, _, _, _, _ ->
-                            updateArtistVideoTransform(changedView as TextureView, player.videoSize)
+                            updateArtistVideoTransform(
+                                changedView as TextureView,
+                                activePlayer.videoSize
+                            )
                         }
                         layoutChangeListener = listener
                         view.addOnLayoutChangeListener(listener)
-                        player.setVideoTextureView(view)
+                        activePlayer.setVideoTextureView(view)
                     }
                 },
                 update = { view ->

@@ -7,11 +7,11 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.BitmapShader
 import android.graphics.Canvas
+import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Shader
-import android.graphics.BitmapShader
-import android.graphics.Matrix
 import android.graphics.drawable.Icon
 import android.os.Build
 import android.os.Handler
@@ -19,7 +19,18 @@ import android.os.Looper
 import android.util.Log
 import com.applemusic.android.lyrics.Lyrics
 import com.applemusic.android.util.ImageLoader
+import com.applemusic.lyricstool.data.AppleLyricsClient
+import com.applemusic.lyricstool.data.FetchedLyrics
+import com.applemusic.lyricstool.data.LyricsCache
+import com.applemusic.lyricstool.data.QQMusicLyricsClient
+import com.applemusic.lyricstool.data.SongHit
 import com.applemusic.lyricstool.R
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import java.lang.reflect.InvocationTargetException
 
 object LiveLyricsNotification {
@@ -27,12 +38,20 @@ object LiveLyricsNotification {
     private const val CHANNEL_ID = "live_lyrics_spotlight"
     private const val NOTIFICATION_ID = 4102
     private const val UPDATE_INTERVAL_MS = 750L
+    private const val LYRIC_RETRY_DELAY_MS = 30_000L
 
     private val handler = Handler(Looper.getMainLooper())
+    private val lyricsScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     @Volatile private var lyricsSongId: String? = null
     @Volatile private var lyrics: Lyrics? = null
     @Volatile private var enabled = true
     private var appContext: Context? = null
+    private var appleLyricsClient: AppleLyricsClient? = null
+    private val qqLyricsClient = QQMusicLyricsClient()
+    private var lyricsCache: LyricsCache? = null
+    private var lyricsRequestJob: Job? = null
+    private var requestedLyricsSongId: String? = null
+    private var lyricsRequestStartedAtMs = 0L
     private var lastSignature: String? = null
     private var lastPromotionStatus: String? = null
     private var requestedArtworkUrl: String? = null
@@ -48,6 +67,8 @@ object LiveLyricsNotification {
 
     fun start(context: Context) {
         appContext = context.applicationContext
+        appleLyricsClient = AppleLyricsClient(context.applicationContext)
+        lyricsCache = LyricsCache(context.applicationContext)
         enabled = context.getSharedPreferences("lyrics_appearance", Context.MODE_PRIVATE)
             .getBoolean("status_bar_lyrics_enabled", true)
         createChannel(context.applicationContext)
@@ -68,6 +89,11 @@ object LiveLyricsNotification {
     fun setLyrics(songId: String, value: Lyrics?) {
         lyricsSongId = songId
         lyrics = value
+        if (value != null) {
+            lyricsRequestJob?.cancel()
+            requestedLyricsSongId = songId
+            lyricsRequestStartedAtMs = System.currentTimeMillis()
+        }
         lastSignature = null
         handler.post { updateNotification() }
     }
@@ -117,6 +143,9 @@ object LiveLyricsNotification {
             song.catalogId.ifBlank { song.uri.removePrefix("apple:") }
         }
         val currentLyrics = lyrics?.takeIf { lyricsSongId == songId }
+        if (currentLyrics == null && songId.isNotBlank()) {
+            requestLyricsIfNeeded(songId, song)
+        }
         val artworkUrl = song.coverUrl
         if (artworkUrl != requestedArtworkUrl) {
             requestedArtworkUrl = artworkUrl
@@ -205,6 +234,100 @@ object LiveLyricsNotification {
         paint.shader = shader
         Canvas(output).drawCircle(size / 2f, size / 2f, size / 2f, paint)
         return output
+    }
+
+    private fun requestLyricsIfNeeded(
+        songId: String,
+        song: com.applemusic.android.apple.AppleLibrarySync.SongRow
+    ) {
+        if (
+            requestedLyricsSongId == songId &&
+            (lyricsRequestJob?.isActive == true ||
+                System.currentTimeMillis() - lyricsRequestStartedAtMs < LYRIC_RETRY_DELAY_MS)
+        ) {
+            return
+        }
+        lyricsRequestJob?.cancel()
+        requestedLyricsSongId = songId
+        lyricsRequestStartedAtMs = System.currentTimeMillis()
+        val appleClient = appleLyricsClient ?: return
+        val cache = lyricsCache ?: return
+        val songHit = SongHit(
+            id = songId,
+            title = song.title,
+            artist = song.artist,
+            album = song.album,
+            artworkUrl = song.coverUrl,
+            durationMs = song.durationMs
+        )
+        lyricsRequestJob = lyricsScope.launch {
+            try {
+                appleClient.reloadSavedSession()
+                val fetched = fetchLyrics(appleClient, cache, songHit)
+                val currentSong = PlaybackEngine.currentSong()
+                val currentSongId = currentSong?.appleId
+                    ?.ifBlank { currentSong.catalogId }
+                    ?.ifBlank { currentSong.uri.removePrefix("apple:") }
+                if (currentSongId == songId && fetched != null) {
+                    lyricsSongId = songId
+                    lyrics = fetched.lyrics
+                    lastSignature = null
+                    handler.post { updateNotification() }
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                Log.e(TAG, "无法获取《${song.title}》的状态栏歌词", error)
+            }
+        }
+    }
+
+    private suspend fun fetchLyrics(
+        appleClient: AppleLyricsClient,
+        cache: LyricsCache,
+        song: SongHit
+    ): FetchedLyrics? {
+        val appleLyrics = cache.get("apple", song.id)
+            ?: appleClient.fetchLyrics(song.id)?.also { cache.put("apple", song.id, it) }
+        if ((appleLyrics?.lyrics?.wordTimedLines() ?: 0) > 0) return appleLyrics
+
+        val cachedQqLyrics = cache.get("qq", song.id)
+        if (cachedQqLyrics != null) return cachedQqLyrics
+        var metadataError: Exception? = null
+        val localizedMetadata = try {
+            appleClient.fetchChineseSongMetadata(song)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            metadataError = error
+            null
+        }
+        return try {
+            val qqLyrics = qqLyricsClient.fetchMatchingLyrics(
+                title = song.title,
+                artist = song.artist,
+                durationMs = song.durationMs,
+                album = song.album,
+                localizedAliases = listOfNotNull(localizedMetadata)
+            )
+            if (qqLyrics == null && metadataError != null) throw metadataError
+            if (qqLyrics != null) {
+                cache.put("qq", song.id, qqLyrics)
+                qqLyrics
+            } else {
+                appleLyrics
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            metadataError?.takeIf { it !== error }?.let(error::addSuppressed)
+            if (appleLyrics != null) {
+                Log.w(TAG, "QQ 歌词不可用，使用 Apple Music 歌词：${error.message}")
+                appleLyrics
+            } else {
+                throw error
+            }
+        }
     }
 
     private fun requestPromotion(builder: Notification.Builder) {

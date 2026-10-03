@@ -34,6 +34,7 @@ class MusicService : MediaSessionService() {
         super.onCreate()
         // 幂等：Activity 里可能已经初始化过
         PlaybackEngine.init(this)
+        LiveLyricsNotification.start(this)
         Logx.i(TAG, "媒体服务已创建")
     }
 

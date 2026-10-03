@@ -11,8 +11,8 @@
 
     <application
         android:allowBackup="false"
-        android:icon="@mipmap/ic_launcher"
-        android:roundIcon="@mipmap/ic_launcher"
+        android:icon="@mipmap/ic_launcher_app"
+        android:roundIcon="@mipmap/ic_launcher_app"
         android:label="@string/app_name"
         android:supportsRtl="true"
         android:theme="@style/Theme.LyricsTool"
@@ -31,12 +31,6 @@
             android:name=".ui.AppleMusicLoginActivity"
             android:exported="false"
             android:windowSoftInputMode="adjustResize" />
-        <activity
-            android:name=".ui.RadioProbeActivity"
-            android:exported="false" />
-        <activity
-            android:name=".ui.FavoriteSongsProbeActivity"
-            android:exported="false" />
         <service
             android:name="com.applemusic.android.player.MusicService"
             android:exported="true"
