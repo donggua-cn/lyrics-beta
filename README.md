@@ -32,11 +32,15 @@ The Android SDK must be configured in Android Studio or through `ANDROID_HOME`/`
 
 ## GitHub Releases
 
-Push a version tag such as `v1.16` to build the release APK and publish it to the repository's
-GitHub Releases. Both the release and debug APKs are attached. Tags containing a hyphen, such as
-`v1.16-rc1`, are published as prereleases. The release APK is currently unsigned; it cannot be
-installed as-is until release signing is configured with a private signing key. The debug APK uses
-a temporary CI debug key and cannot update an app signed with a different key.
+Every push builds the debug and release APKs in GitHub Actions. Download them from the run's
+**Artifacts** section; artifacts are retained for 30 days. The debug APK is signed with a temporary
+CI debug key and can be installed for testing, but cannot update an app signed with a different key.
+The release APK is unsigned and cannot be installed as-is.
+
+To publish both APKs to GitHub Releases on demand, open **Actions → Android Release → Run workflow**,
+choose the branch to build, and enter a new version tag such as `v1.16`. Tags containing a hyphen,
+such as `v1.16-rc1`, are published as prereleases. Pushing a `v*` version tag also publishes a
+release automatically.
 
 ## Personalized radio probe
 
