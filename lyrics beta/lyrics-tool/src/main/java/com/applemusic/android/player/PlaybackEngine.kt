@@ -391,7 +391,15 @@ object PlaybackEngine {
         if (!pendingPlaybackRestore) return
         val uri = synchronized(queue) { queue.getOrNull(queueIndex) } ?: return
         pendingPlaybackRestore = false
-        prepareAndPlay(uri, restorePositionMs, restorePlayWhenReady)
+        restorePlayWhenReady = false
+        prepareAndPlay(uri, restorePositionMs, playWhenReady = false)
+    }
+
+    fun pauseForTaskRemoval() {
+        restorePlayWhenReady = false
+        player?.pause()
+        persistQueueState()
+        onStateChanged?.invoke()
     }
 
     /** 用一列 uri 播放下标 index 的歌。 */
@@ -684,9 +692,10 @@ object PlaybackEngine {
             queueIndex = selectedIndex
             playingIndex = restoredPlayingIndex
             restorePositionMs = snapshot.optLong("positionMs", 0L).coerceAtLeast(0L)
-            restorePlayWhenReady = snapshot.optBoolean("isPlaying", false)
+            restorePlayWhenReady = false
             pendingPlaybackRestore = true
-            Logx.i(TAG, "恢复播放队列 ${uris.size} 首，当前位置=$selectedIndex，续播=$restorePlayWhenReady")
+            persistQueueState()
+            Logx.i(TAG, "恢复播放队列 ${uris.size} 首，当前位置=$selectedIndex；重新进入时保持暂停")
         } catch (error: Exception) {
             Logx.e(TAG, "恢复播放队列失败：${error.message}", error)
         }

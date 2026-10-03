@@ -12,7 +12,7 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * 策略（与原实现一致）：
  *   - 解密后的音频落在 App 私有 cacheDir/apple_music/<id>.m4a
- *   - 用户可设置 0.5–20GB 上限；超出按 LRU 淘汰到 90%（pinned 的不动）
+ *   - 用户可设置 0.1–20GB 上限；超出按 LRU 淘汰到 90%（pinned 的不动）
  *   - 索引持久化到 SharedPreferences（JSON），重启后仍能命中
  *   - 小于 128KB 的文件视为损坏（半截文件）直接作废
  *
@@ -29,7 +29,7 @@ class AppleCache(private val context: Context, private val api: AppleApi) {
         private const val KEY_SCHEMA = "schema_version"
         private const val KEY_MAX_BYTES = "max_cache_bytes"
         private const val DEFAULT_MAX_BYTES = 3L * 1024 * 1024 * 1024
-        private const val MIN_MAX_BYTES = 512L * 1024 * 1024
+        private const val MIN_MAX_BYTES = 100L * 1024 * 1024
         private const val MAX_MAX_BYTES = 20L * 1024 * 1024 * 1024
         /**
          * 缓存格式版本：不一致就把整个缓存清掉。

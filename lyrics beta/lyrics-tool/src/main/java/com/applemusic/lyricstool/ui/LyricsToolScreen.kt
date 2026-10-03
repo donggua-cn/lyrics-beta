@@ -7151,6 +7151,7 @@ private fun SettingsPage(
     val supportsDynamicColor = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
     val manualThemeActive = !useDynamicColors
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val systemDark = isSystemInDarkTheme()
     val fallbackMonetColor = MaterialTheme.colorScheme.primary
     val monetColor = remember(
@@ -7506,7 +7507,7 @@ private fun PlaybackCacheLimitCard(
     limitBytes: Long,
     onLimitChange: (Long) -> Unit
 ) {
-    val minGigabytes = 0.5f
+    val minGigabytes = 0.1f
     val maxGigabytes = 20f
     var sliderValue by remember(limitBytes) {
         mutableFloatStateOf(limitBytes.toFloat() / BYTES_PER_GIGABYTE)
@@ -7542,13 +7543,13 @@ private fun PlaybackCacheLimitCard(
                 value = sliderValue,
                 onValueChange = { sliderValue = it },
                 onValueChangeFinished = {
-                    val selectedGigabytes = (sliderValue * 2).roundToInt() / 2f
+                    val selectedGigabytes = (sliderValue * 10).roundToInt() / 10f
                     sliderValue = selectedGigabytes
                     onLimitChange((selectedGigabytes * BYTES_PER_GIGABYTE).toLong())
                 },
                 modifier = Modifier.height(34.dp),
                 valueRange = minGigabytes..maxGigabytes,
-                steps = 38
+                steps = 198
             )
         }
     }

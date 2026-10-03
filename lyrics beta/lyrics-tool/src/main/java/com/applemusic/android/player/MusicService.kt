@@ -74,15 +74,11 @@ class MusicService : MediaSessionService() {
         }
     }
 
-    /**
-     * 用户从「最近任务」划掉卡片时：没在播就收工，在播就继续（音乐类应用的惯例）。
-     */
+    /** 清除最近任务时保存播放位置并暂停；下次打开只恢复状态，不自动出声。 */
     override fun onTaskRemoved(rootIntent: Intent?) {
-        val playing = PlaybackEngine.isPlaying()
-        Logx.i(TAG, "任务被移除，isPlaying=$playing")
-        if (!playing) {
-            stopSelf()
-        }
+        PlaybackEngine.pauseForTaskRemoval()
+        Logx.i(TAG, "任务被移除，播放已暂停并保存队列")
+        stopSelf()
         super.onTaskRemoved(rootIntent)
     }
 

@@ -181,6 +181,20 @@ class AppleApi(private val prefs: TokenStore) {
         return parsePlaylists(ampGet("/v1/me/library/playlists?limit=$limit&offset=$offset&l=en-US"))
     }
 
+    fun getAllLibraryPlaylists(): List<ApplePlaylist> {
+        val playlists = ArrayList<ApplePlaylist>()
+        var offset = 0
+        var guard = 0
+        while (guard < 50) {
+            val page = getLibraryPlaylists(100, offset)
+            playlists.addAll(page.items)
+            offset += page.items.size
+            if (page.items.size < 100) break
+            guard++
+        }
+        return playlists
+    }
+
     /** 歌单内的歌曲（自动歌单会 404，属正常）。 */
     fun getPlaylistTracks(playlistId: String, limit: Int, offset: Int): PageResult<AppleSong> {
         val path = "/v1/me/library/playlists/$playlistId/tracks?limit=$limit&offset=$offset&l=en-US"
@@ -194,11 +208,12 @@ class AppleApi(private val prefs: TokenStore) {
         prefs.putString("favorite_playlist_id", playlistId)
     }
 
-    /** 获取已验证的 Apple 喜爱歌曲歌单中的目录歌曲 ID。 */
+    /** 自动绑定 Favorite Songs 智能歌单，并读取其全部曲目目录 ID。 */
     fun getFavoriteCatalogSongIds(): Set<String> {
-        val configuredPlaylistId = favoritePlaylistId()
         val favoritePlaylistNames = setOf(
             "favorite songs",
+            "favorites",
+            "liked songs",
             "喜爱歌曲",
             "喜爱的歌曲",
             "喜欢的歌曲",
@@ -208,32 +223,47 @@ class AppleApi(private val prefs: TokenStore) {
             "最爱音乐",
             "最喜欢的歌曲",
             "最喜欢的音乐"
-        )
-        val favoritePlaylist = if (configuredPlaylistId.isNotBlank()) {
-            ApplePlaylist(id = configuredPlaylistId)
-        } else {
-            val playlists = ArrayList<ApplePlaylist>()
-            var offset = 0
-            var playlistPage = getLibraryPlaylists(100, offset)
-            var guard = 0
-            while (playlistPage.items.isNotEmpty() && guard < 50) {
-                playlists.addAll(playlistPage.items)
-                offset += playlistPage.items.size
-                if (playlistPage.items.size < 100) break
-                playlistPage = getLibraryPlaylists(100, offset)
-                guard++
+        ).mapTo(HashSet(), ::normalizeFavoritePlaylistName)
+
+        fun findFavoritePlaylist(): ApplePlaylist? =
+            getAllLibraryPlaylists().firstOrNull { playlist ->
+                normalizeFavoritePlaylistName(playlist.name) in favoritePlaylistNames
             }
-            playlists.firstOrNull {
-                it.name.trim().lowercase() in favoritePlaylistNames
-            } ?: throw IllegalStateException(
-                "Apple Music 资料库中未找到喜爱歌曲歌单；请在歌单诊断页指定已验证的歌单"
-            )
+
+        val configuredPlaylistId = favoritePlaylistId()
+        var favoritePlaylist = configuredPlaylistId.takeIf(String::isNotBlank)
+            ?.let { ApplePlaylist(id = it) }
+        if (favoritePlaylist == null) {
+            favoritePlaylist = findFavoritePlaylist()
+                ?: throw IllegalStateException(
+                    "Apple Music 资料库中未找到 Favorite Songs 喜爱歌曲歌单"
+                )
+            setFavoritePlaylistId(favoritePlaylist.id)
+            Logx.i(TAG, "已自动绑定 Favorite Songs 歌单：${favoritePlaylist.id}")
         }
 
+        return try {
+            readFavoritePlaylistCatalogSongIds(favoritePlaylist.id)
+        } catch (configuredError: RuntimeException) {
+            if (configuredPlaylistId.isBlank()) throw configuredError
+            Logx.w(
+                TAG,
+                "已绑定喜爱歌单不可读取，重新查找 Favorite Songs：${configuredError.message}"
+            )
+            val discoveredPlaylist = findFavoritePlaylist()
+                ?.takeIf { it.id != configuredPlaylistId }
+                ?: throw configuredError
+            setFavoritePlaylistId(discoveredPlaylist.id)
+            Logx.i(TAG, "已重新绑定 Favorite Songs 歌单：${discoveredPlaylist.id}")
+            readFavoritePlaylistCatalogSongIds(discoveredPlaylist.id)
+        }
+    }
+
+    private fun readFavoritePlaylistCatalogSongIds(playlistId: String): Set<String> {
         val songIds = LinkedHashSet<String>()
         val seenPageSignatures = HashSet<String>()
         var offset = 0
-        var songPage = getPlaylistTracks(favoritePlaylist.id, 100, offset)
+        var songPage = getPlaylistTracks(playlistId, 100, offset)
         var guard = 0
         while (songPage.items.isNotEmpty() && guard < 100) {
             val pageIds = songPage.items.map { song ->
@@ -243,11 +273,15 @@ class AppleApi(private val prefs: TokenStore) {
             pageIds.forEach { songIds.add(it) }
             offset += songPage.items.size
             if (songPage.next.isBlank() && songPage.total > 0 && offset >= songPage.total) break
-            songPage = getPlaylistTracks(favoritePlaylist.id, 100, offset)
+            songPage = getPlaylistTracks(playlistId, 100, offset)
             guard++
         }
         return songIds
     }
+
+    private fun normalizeFavoritePlaylistName(name: String): String =
+        name.lowercase(java.util.Locale.ROOT)
+            .replace(Regex("[^\\p{L}\\p{N}]"), "")
 
     /**
      * **目录歌单**的曲目。
