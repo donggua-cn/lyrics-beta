@@ -34,6 +34,20 @@ class AppleApi(private val prefs: TokenStore) {
         val body: String
     )
 
+    class FavoritePlaylistNotFoundException(
+        val playlists: List<ApplePlaylist>
+    ) : IllegalStateException(
+        buildString {
+            append("Apple Music 返回了 ${playlists.size} 个资料库歌单，但没有识别到 Favorite Songs")
+            val names = playlists.map { it.name.trim() }.filter(String::isNotBlank)
+            if (names.isNotEmpty()) {
+                append("。歌单名称：")
+                append(names.take(20).joinToString("、"))
+                if (names.size > 20) append(" 等（共 ${names.size} 个有名称的歌单）")
+            }
+        }
+    )
+
     @Volatile
     var devToken: String = ""
         private set
@@ -212,7 +226,9 @@ class AppleApi(private val prefs: TokenStore) {
     fun getFavoriteCatalogSongIds(): Set<String> {
         val favoritePlaylistNames = setOf(
             "favorite songs",
+            "favourite songs",
             "favorites",
+            "favourites",
             "liked songs",
             "喜爱歌曲",
             "喜爱的歌曲",
@@ -225,25 +241,26 @@ class AppleApi(private val prefs: TokenStore) {
             "最喜欢的音乐"
         ).mapTo(HashSet(), ::normalizeFavoritePlaylistName)
 
-        fun findFavoritePlaylist(): ApplePlaylist? =
-            getAllLibraryPlaylists().firstOrNull { playlist ->
+        var discoveredPlaylists = emptyList<ApplePlaylist>()
+        fun findFavoritePlaylist(): ApplePlaylist? {
+            discoveredPlaylists = getAllLibraryPlaylists()
+            return discoveredPlaylists.firstOrNull { playlist ->
                 normalizeFavoritePlaylistName(playlist.name) in favoritePlaylistNames
             }
+        }
 
         val configuredPlaylistId = favoritePlaylistId()
         var favoritePlaylist = configuredPlaylistId.takeIf(String::isNotBlank)
             ?.let { ApplePlaylist(id = it) }
         if (favoritePlaylist == null) {
             favoritePlaylist = findFavoritePlaylist()
-                ?: throw IllegalStateException(
-                    "Apple Music 资料库中未找到 Favorite Songs 喜爱歌曲歌单"
-                )
+                ?: throw FavoritePlaylistNotFoundException(discoveredPlaylists)
             setFavoritePlaylistId(favoritePlaylist.id)
             Logx.i(TAG, "已自动绑定 Favorite Songs 歌单：${favoritePlaylist.id}")
         }
 
         return try {
-            readFavoritePlaylistCatalogSongIds(favoritePlaylist.id)
+            getFavoritePlaylistCatalogSongIds(favoritePlaylist.id)
         } catch (configuredError: RuntimeException) {
             if (configuredPlaylistId.isBlank()) throw configuredError
             Logx.w(
@@ -252,14 +269,14 @@ class AppleApi(private val prefs: TokenStore) {
             )
             val discoveredPlaylist = findFavoritePlaylist()
                 ?.takeIf { it.id != configuredPlaylistId }
-                ?: throw configuredError
+                ?: throw FavoritePlaylistNotFoundException(discoveredPlaylists)
             setFavoritePlaylistId(discoveredPlaylist.id)
             Logx.i(TAG, "已重新绑定 Favorite Songs 歌单：${discoveredPlaylist.id}")
-            readFavoritePlaylistCatalogSongIds(discoveredPlaylist.id)
+            getFavoritePlaylistCatalogSongIds(discoveredPlaylist.id)
         }
     }
 
-    private fun readFavoritePlaylistCatalogSongIds(playlistId: String): Set<String> {
+    private fun getFavoritePlaylistCatalogSongIds(playlistId: String): Set<String> {
         val songIds = LinkedHashSet<String>()
         val seenPageSignatures = HashSet<String>()
         var offset = 0

@@ -30,6 +30,14 @@ The debug APK is written to `lyrics-tool/build/outputs/apk/debug/lyrics-tool-deb
 
 The Android SDK must be configured in Android Studio or through `ANDROID_HOME`/`ANDROID_SDK_ROOT`.
 
+## GitHub Releases
+
+Push a version tag such as `v1.16` to build the release APK and publish it to the repository's
+GitHub Releases. Both the release and debug APKs are attached. Tags containing a hyphen, such as
+`v1.16-rc1`, are published as prereleases. The release APK is currently unsigned; it cannot be
+installed as-is until release signing is configured with a private signing key. The debug APK uses
+a temporary CI debug key and cannot update an app signed with a different key.
+
 ## Personalized radio probe
 
 After connecting an Apple Music account, open **Settings → 个性电台接口测试**, refresh the

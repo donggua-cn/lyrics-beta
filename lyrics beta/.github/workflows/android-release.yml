@@ -1,0 +1,60 @@
+name: Android Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platforms;android-36
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build release APK
+        working-directory: lyrics beta
+        run: |
+          bash ./gradlew :lyrics-tool:assembleRelease \
+            -x :lyrics-core:lintVitalAnalyzeRelease \
+            -x :lyrics-core:lintVitalRelease \
+            -x :lyrics-tool:lintVitalAnalyzeRelease \
+            -x :lyrics-tool:lintVitalRelease
+
+      - name: Build debug APK
+        working-directory: lyrics beta
+        run: bash ./gradlew :lyrics-tool:assembleDebug
+
+      - name: Publish APK to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Lyrics ${{ github.ref_name }}
+          body: |
+            > **Unsigned APK:** This package is not signed and cannot be installed as-is or used to update an installed app. Configure release signing before distributing an installable APK.
+
+            > **Debug APK:** Signed with a temporary CI debug key. It can be installed for testing, but cannot update an app signed with a different key.
+
+            Built from tag `${{ github.ref_name }}`.
+          files: |
+            lyrics beta/lyrics-tool/build/outputs/apk/release/lyrics-tool-release-unsigned.apk
+            lyrics beta/lyrics-tool/build/outputs/apk/debug/lyrics-tool-debug.apk
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
