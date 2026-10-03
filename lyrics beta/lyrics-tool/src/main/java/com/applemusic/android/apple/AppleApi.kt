@@ -4,6 +4,8 @@ import com.applemusic.android.net.Http
 import com.applemusic.android.util.Logx
 import org.json.JSONArray
 import org.json.JSONObject
+import java.time.Instant
+import java.time.ZoneId
 
 /**
  * Apple Music API 客户端 —— 对应鸿蒙版 `AppleApi.ets`（全项目最核心的一个文件）。
@@ -256,8 +258,11 @@ class AppleApi(private val prefs: TokenStore) {
      */
     fun getCatalogPlaylistTracks(playlistId: String, limit: Int, offset: Int): PageResult<AppleSong> {
         val sf = if (storefront.isNotEmpty()) storefront else "us"
-        val path = "/v1/catalog/$sf/playlists/$playlistId/tracks?limit=$limit&offset=$offset&l=en-US"
-        return parseSongs(ampGet(path), false)
+        val path =
+            "/v1/catalog/$sf/playlists/$playlistId/tracks?limit=$limit&offset=$offset&l=${langTag()}"
+        return parseSongs(ampGet(path), false).also { page ->
+            localizeCatalogSongs(page.items)
+        }
     }
 
     /**
@@ -268,11 +273,222 @@ class AppleApi(private val prefs: TokenStore) {
      *
      * 注意判断顺序：`pl.` 也以 `p` 开头，所以必须用 `startsWith("p.")` 来区分。
      */
-    fun getAnyPlaylistTracks(playlistId: String, limit: Int, offset: Int): PageResult<AppleSong> {
-        return if (playlistId.startsWith("p.")) {
+    fun getAnyPlaylistTracks(
+        playlistId: String,
+        limit: Int,
+        offset: Int,
+        isLibraryPlaylist: Boolean = playlistId.startsWith("p.")
+    ): PageResult<AppleSong> {
+        return if (isLibraryPlaylist) {
             getPlaylistTracks(playlistId, limit, offset)
         } else {
             getCatalogPlaylistTracks(playlistId, limit, offset)
+        }
+    }
+
+    /** 从主页推荐资源读取歌单曲目，保留资料库歌单与目录歌单的真实资源类型。 */
+    fun getRecommendedPlaylistTracks(
+        playlistId: String,
+        relatedCatalogId: String,
+        isLibraryPlaylist: Boolean,
+        limit: Int,
+        offset: Int
+    ): PageResult<AppleSong> {
+        return when {
+            !isLibraryPlaylist ->
+                getCatalogPlaylistTracks(playlistId, limit, offset)
+            relatedCatalogId.isNotBlank() ->
+                getCatalogPlaylistTracks(relatedCatalogId, limit, offset)
+            else ->
+                getPlaylistTracks(playlistId, limit, offset)
+        }
+    }
+
+    /** Read a recommended album's tracks from its catalog resource or library relationship. */
+    fun getRecommendedAlbumTracks(
+        albumId: String,
+        relatedCatalogId: String,
+        isLibraryAlbum: Boolean,
+        resolvedCatalogId: String = "",
+        catalogStorefront: String = storefront
+    ): List<AppleSong> {
+        val catalogId = resolvedCatalogId.ifBlank { relatedCatalogId }
+        if (catalogId.isNotBlank()) {
+            return getCatalogAlbumTracks(catalogId, catalogStorefront)
+        }
+        if (!isLibraryAlbum) return getCatalogAlbumTracks(albumId, catalogStorefront)
+        require(albumId.matches(Regex("[A-Za-z0-9._-]+"))) { "无效的资料库专辑 ID" }
+        val root = JSONObject(
+            ampGet("/v1/me/library/albums/$albumId/tracks?limit=100&l=${langTag()}")
+        )
+        val tracks = root.optJSONArray("data")
+            ?: throw IllegalStateException("Apple Music 没有返回资料库专辑曲目")
+        return pickSongs(JSONObject().put("data", tracks), "data", true)
+    }
+
+    /** Load complete collection metadata, including the responsive portrait motion-art assets. */
+    fun getRecommendedCollectionMetadata(
+        item: ShelfItem,
+        preferSquareArtwork: Boolean = false
+    ): CollectionMetadata {
+        require(item.isAlbum || item.isPlaylist) { "不支持获取此类型的详情：${item.type}" }
+
+        val resourceType = if (item.isAlbum) "albums" else "playlists"
+        val libraryType = if (item.isAlbum) "albums" else "playlists"
+        var libraryAttributes = JSONObject()
+        var catalogId = item.relatedCatalogId
+
+        if (item.type.contains("library", ignoreCase = true) && catalogId.isBlank()) {
+            require(item.id.matches(Regex("[A-Za-z0-9._-]+"))) { "无效的资料库内容 ID" }
+            val libraryResource = JSONObject(
+                ampGet(
+                    "/v1/me/library/$libraryType/${item.id}" +
+                        "?include=catalog&l=${langTag()}"
+                )
+            ).optJSONArray("data")?.optJSONObject(0)
+                ?: throw IllegalStateException("Apple Music 没有返回《${item.title}》的详情")
+            libraryAttributes = libraryResource.optJSONObject("attributes") ?: JSONObject()
+            catalogId = libraryResource.optJSONObject("relationships")
+                ?.optJSONObject("catalog")
+                ?.optJSONArray("data")
+                ?.optJSONObject(0)
+                ?.optString("id", "")
+                .orEmpty()
+        }
+
+        val catalogStorefront = item.catalogStorefront.ifBlank { storefront }
+        val catalogLanguage = if (catalogStorefront == "cn") "zh-Hans-CN" else langTag()
+        val catalogResource: JSONObject? =
+            if (catalogId.isNotBlank() || !item.type.contains("library", true)) {
+            val resolvedCatalogId = catalogId.ifBlank { item.id }
+            require(resolvedCatalogId.matches(Regex("[A-Za-z0-9._-]+"))) {
+                "无效的目录内容 ID"
+            }
+            catalogId = resolvedCatalogId
+            val includeCurator = if (item.isPlaylist) "&include=curator" else "&include=artists"
+            JSONObject(
+                ampGet(
+                    "/v1/catalog/$catalogStorefront/$resourceType/$resolvedCatalogId" +
+                        "?extend=editorialArtwork%2CeditorialVideo$includeCurator" +
+                        "&l=$catalogLanguage"
+                )
+            ).optJSONArray("data")?.optJSONObject(0)
+                ?: throw IllegalStateException("Apple Music 没有返回《${item.title}》的目录详情")
+        } else {
+            null
+        }
+        val catalogAttributes = catalogResource?.optJSONObject("attributes") ?: JSONObject()
+
+        val artwork = catalogAttributes.optJSONObject("editorialArtwork")
+            ?.optJSONObject("staticDetailTall")
+        val editorialVideo = catalogAttributes.optJSONObject("editorialVideo")
+        val motion = if (preferSquareArtwork) {
+            editorialVideo?.optJSONObject("motionDetailSquare")
+                ?: editorialVideo?.optJSONObject("motionDetailTall")
+                ?: editorialVideo?.optJSONObject("motionTallVideo3x4")
+        } else {
+            editorialVideo?.optJSONObject("motionDetailTall")
+                ?: editorialVideo?.optJSONObject("motionTallVideo3x4")
+                ?: editorialVideo?.optJSONObject("motionDetailSquare")
+        }
+        val preview = motion?.optJSONObject("previewFrame")
+        val description = collectionDescription(catalogAttributes)
+            .ifBlank { collectionDescription(libraryAttributes) }
+            .ifBlank { item.collectionDescription }
+        val creator = catalogAttributes.optString("curatorName", "")
+            .ifBlank {
+                catalogAttributes.optJSONObject("editorialNotes")
+                    ?.optString("name", "")
+                    .orEmpty()
+            }
+            .ifBlank { catalogAttributes.optString("artistName", "") }
+            .ifBlank { libraryAttributes.optString("curatorName", "") }
+            .ifBlank { item.creator }
+        val creatorId = catalogResource?.optJSONObject("relationships")
+            ?.optJSONObject("artists")
+            ?.optJSONArray("data")
+            ?.optJSONObject(0)
+            ?.optString("id", "")
+            .orEmpty()
+        val ratioSource = preview ?: artwork
+        val width = ratioSource?.optDouble("width", 0.0) ?: 0.0
+        val height = ratioSource?.optDouble("height", 0.0) ?: 0.0
+        val aspectRatio = if (width > 0.0 && height > 0.0) {
+            (width / height).toFloat().coerceIn(0.5f, 2f)
+        } else {
+            item.artworkAspectRatio
+        }
+
+        return CollectionMetadata(
+            title = catalogAttributes.optString("name", "").ifBlank { item.title },
+            catalogId = catalogId,
+            creator = creator,
+            creatorId = creatorId,
+            description = description,
+            trackCount = catalogAttributes.optInt("trackCount", 0)
+                .takeIf { it > 0 }
+                ?: libraryAttributes.optInt("trackCount", 0)
+                .takeIf { it > 0 }
+                ?: item.trackCount,
+            updatedAt = catalogAttributes.optString("lastModifiedDate", "")
+                .ifBlank { catalogAttributes.optString("releaseDate", "") }
+                .ifBlank { libraryAttributes.optString("lastModifiedDate", "") }
+                .ifBlank { item.updatedAt },
+            artworkUrl = motionArtworkUrl(
+                preview,
+                targetWidth = 600,
+                targetHeight = if (preferSquareArtwork) 600 else 800
+            )
+                .ifBlank { artwork?.optString("url", "").orEmpty() }
+                .ifBlank {
+                    catalogAttributes.optJSONObject("artwork")?.optString("url", "").orEmpty()
+                }
+                .ifBlank { item.artwork },
+            ambientVideoUrl = motion?.optString("video", "").orEmpty()
+                .ifBlank { item.ambientVideoUrl },
+            ambientPreviewUrl = if (preferSquareArtwork) {
+                item.ambientPreviewUrl
+            } else {
+                motionArtworkUrl(preview, 600, 800)
+            }
+                .ifBlank { item.ambientPreviewUrl },
+            ambientSquareVideoUrl = editorialVideo
+                ?.optJSONObject("motionDetailSquare")
+                ?.optString("video", "")
+                .orEmpty()
+                .ifBlank { item.ambientSquareVideoUrl },
+            ambientSquarePreviewUrl = motionArtworkUrl(
+                editorialVideo?.optJSONObject("motionDetailSquare")?.optJSONObject("previewFrame"),
+                600,
+                600
+            ).ifBlank { item.ambientSquarePreviewUrl },
+            artworkAspectRatio = aspectRatio
+        )
+    }
+
+    private fun motionArtworkUrl(
+        frame: JSONObject?,
+        targetWidth: Int,
+        targetHeight: Int
+    ): String {
+        val url = frame?.optString("url", "").orEmpty()
+        if (url.isBlank()) return ""
+        return url.replace("{w}", targetWidth.toString())
+            .replace("{h}", targetHeight.toString())
+            .replace("{f}", "jpg")
+    }
+
+    private fun collectionDescription(attributes: JSONObject): String {
+        val description = attributes.opt("description")
+        return when (description) {
+            is JSONObject -> description.optString(
+                "standard",
+                description.optString("stringForDisplay", "")
+            )
+            is String -> description
+            else -> attributes.optJSONObject("editorialNotes")
+                ?.optString("standard", "")
+                .orEmpty()
         }
     }
 
@@ -370,15 +586,164 @@ class AppleApi(private val prefs: TokenStore) {
     fun getCatalogArtist(artistId: String): AppleArtist? {
         if (artistId.isEmpty()) return null
         return try {
-            val txt = ampGet("/v1/catalog/$storefront/artists/$artistId?l=${langTag()}")
-            val data = JSONObject(txt).optJSONArray("data") ?: return null
+            fun fetchArtistResource(
+                language: String,
+                includeMotionArtwork: Boolean = true
+            ): JSONObject {
+                val motionExtension = if (includeMotionArtwork) "%2CeditorialVideo" else ""
+                return JSONObject(
+                    ampGet(
+                        "/v1/catalog/cn/artists/$artistId" +
+                            "?extend=artistBio%2CbornOrFormed%2Corigin%2CeditorialArtwork%2C" +
+                            "hero%2ChasBiographyContent%2CisGroup%2CplainEditorialNotes" +
+                            motionExtension +
+                            "&include=artist-biography-canvas" +
+                            "&format%5Bresources%5D=map&l=$language&platform=web"
+                    )
+                )
+            }
+
+            fun textContent(value: Any?): String = when (value) {
+                is String -> value.trim()
+                is JSONObject -> sequenceOf(
+                    "standard",
+                    "text",
+                    "value",
+                    "content",
+                    "description",
+                    "paragraphs",
+                    "data"
+                )
+                    .map { key -> textContent(value.opt(key)) }
+                    .firstOrNull(String::isNotBlank)
+                    .orEmpty()
+                is JSONArray -> (0 until value.length())
+                    .asSequence()
+                    .map { index -> textContent(value.opt(index)) }
+                    .filter(String::isNotBlank)
+                    .joinToString("\n\n")
+                else -> ""
+            }
+
+            fun editorialDescription(attributes: JSONObject): String {
+                return sequenceOf("artistBio", "plainEditorialNotes", "editorialNotes")
+                    .map { key -> textContent(attributes.opt(key)) }
+                    .firstOrNull(String::isNotBlank)
+                    .orEmpty()
+            }
+
+            fun canvasBiography(response: JSONObject): String {
+                val paragraphs = LinkedHashSet<String>()
+                fun collect(value: Any?) {
+                    when (value) {
+                        is JSONObject -> {
+                            val attributes = value.optJSONObject("attributes")
+                            val style = attributes?.optJSONObject("display")
+                                ?.optString("style", "")
+                            if (style == "artist-about-text") {
+                                textContent(attributes.opt("text"))
+                                    .takeIf(String::isNotBlank)
+                                    ?.let(paragraphs::add)
+                            }
+                            val keys = value.keys()
+                            while (keys.hasNext()) collect(value.opt(keys.next()))
+                        }
+                        is JSONArray -> {
+                            for (index in 0 until value.length()) collect(value.opt(index))
+                        }
+                    }
+                }
+                collect(response)
+                return paragraphs.joinToString("\n\n")
+            }
+
+            val root = fetchArtistResource("zh-Hans-CN")
+            val data = root.optJSONArray("data") ?: return null
             if (data.length() == 0) return null
-            val it = data.getJSONObject(0)
+            val artistReference = data.getJSONObject(0)
+            val artistResource = resolveResource(
+                artistReference,
+                root.optJSONObject("resources") ?: JSONObject()
+            )
             val a = AppleArtist()
-            a.id = it.optString("id", "")
-            val attrs = it.optJSONObject("attributes") ?: JSONObject()
+            a.id = artistResource.optString(
+                "id",
+                artistReference.optString("id", "")
+            )
+            val attrs = artistResource.optJSONObject("attributes") ?: JSONObject()
             a.name = attrs.optString("name", "")
             a.artworkUrl = bigArtwork(attrs.optJSONObject("artwork")?.optString("url", "") ?: "")
+            a.bornOrFormed = attrs.optString("bornOrFormed", "")
+            a.isGroup = attrs.optBoolean("isGroup", false)
+            a.genreNames = attrs.optJSONArray("genreNames")?.let { genres ->
+                (0 until genres.length())
+                    .map { index -> genres.optString(index, "").trim() }
+                    .filter(String::isNotBlank)
+            }.orEmpty()
+            val editorialVideo = attrs.optJSONObject("editorialVideo")
+            val motion = editorialVideo?.optJSONObject("motionArtistFullscreen16x9")
+                ?: editorialVideo?.optJSONObject("motionArtistWide16x9")
+                ?: editorialVideo?.optJSONObject("motionArtistSquare1x1")
+            val preview = motion?.optJSONObject("previewFrame")
+            a.motionVideoUrl = motion?.optString("video", "").orEmpty()
+            a.motionPreviewUrl = preview?.optString("url", "").orEmpty()
+                .replace("{w}", "2400")
+                .replace("{h}", "1350")
+                .replace("{f}", "jpg")
+            a.motionBackgroundColor = preview?.optString("bgColor", "").orEmpty()
+            a.motionTextColor = preview?.optString("textColor1", "").orEmpty()
+            a.editorialDescription = canvasBiography(root)
+                .ifBlank { editorialDescription(attrs) }
+            if (a.editorialDescription.isBlank()) {
+                try {
+                    val biographyRoot = fetchArtistResource(
+                        "zh-Hans-CN",
+                        includeMotionArtwork = false
+                    )
+                    val biographyReference =
+                        biographyRoot.optJSONArray("data")?.optJSONObject(0)
+                    val biographyArtist = biographyReference?.let {
+                        resolveResource(
+                            it,
+                            biographyRoot.optJSONObject("resources") ?: JSONObject()
+                        )
+                    }
+                    val biographyAttributes =
+                        biographyArtist?.optJSONObject("attributes") ?: JSONObject()
+                    a.editorialDescription = canvasBiography(biographyRoot)
+                        .ifBlank { editorialDescription(biographyAttributes) }
+                } catch (error: Exception) {
+                    Logx.w(
+                        TAG,
+                        "getCatalogArtist biography request failed $artistId: ${error.message}"
+                    )
+                }
+            }
+            if (a.editorialDescription.isBlank()) {
+                try {
+                    val englishRoot = fetchArtistResource(
+                        "en-US",
+                        includeMotionArtwork = false
+                    )
+                    val englishReference =
+                        englishRoot.optJSONArray("data")?.optJSONObject(0)
+                    val englishArtist = englishReference?.let {
+                        resolveResource(
+                            it,
+                            englishRoot.optJSONObject("resources") ?: JSONObject()
+                        )
+                    }
+                    val englishAttributes =
+                        englishArtist?.optJSONObject("attributes") ?: JSONObject()
+                    a.editorialDescription = editorialDescription(englishAttributes)
+                        .ifBlank { canvasBiography(englishRoot) }
+                } catch (error: Exception) {
+                    Logx.w(
+                        TAG,
+                        "getCatalogArtist editorial fallback failed $artistId: ${error.message}"
+                    )
+                }
+            }
             if (a.name.isEmpty()) null else a
         } catch (e: Throwable) {
             Logx.w(TAG, "getCatalogArtist failed $artistId: ${e.message}")
@@ -388,15 +753,151 @@ class AppleApi(private val prefs: TokenStore) {
 
     /** 某位目录艺人的专辑列表（分页，用于「补齐资料库」）。 */
     fun getCatalogArtistAlbums(artistId: String, limit: Int, offset: Int): List<AppleAlbum> {
-        val path = "/v1/catalog/$storefront/artists/$artistId/albums?limit=$limit&offset=$offset&l=en-US"
-        return pickAlbums(JSONObject(ampGet(path)), "data", false)
+        val path =
+            "/v1/catalog/cn/artists/$artistId/albums?limit=$limit&offset=$offset&l=zh-Hans-CN"
+        return pickAlbums(JSONObject(ampGet(path)), "data", false).onEach {
+            it.catalogStorefront = "cn"
+        }
+    }
+
+    fun getCatalogArtistTopSongs(
+        artistId: String,
+        limit: Int = 20,
+        offset: Int = 0
+    ): List<AppleSong> {
+        require(artistId.matches(Regex("[A-Za-z0-9._-]+"))) { "无效的目录艺人 ID" }
+        val root = JSONObject(
+            ampGet(
+                "/v1/catalog/$storefront/artists/$artistId/view/top-songs" +
+                    "?l=${langTag()}&limit=$limit&offset=$offset"
+            )
+        )
+        return pickSongs(root, "data", false).onEach { it.artistId = artistId }
+    }
+
+    fun getFavoriteCatalogArtistIds(): Set<String>? {
+        return try {
+            val root = JSONObject(
+                ampGet("/v1/me/favorites?types=artists&limit=100&l=${langTag()}&platform=web")
+            )
+            val data = root.optJSONArray("data") ?: return emptySet()
+            buildSet {
+                for (index in 0 until data.length()) {
+                    data.optJSONObject(index)?.optString("id")
+                        ?.takeIf(String::isNotBlank)
+                        ?.let(::add)
+                }
+            }
+        } catch (error: Exception) {
+            Logx.w(TAG, "无法读取已收藏艺人（此视图可能不受 storefront 支持）：${error.message}")
+            null
+        }
+    }
+
+    fun setCatalogArtistFavorite(artistId: String, favorite: Boolean) {
+        require(artistId.matches(Regex("[A-Za-z0-9._-]+"))) {
+            "无效的目录艺人 ID"
+        }
+        ensureReady()
+        val encodedId = java.net.URLEncoder.encode(artistId, "UTF-8")
+        val path = "/v1/me/favorites?art%5Burl%5D=f&ids%5Bartists%5D=$encodedId" +
+            "&l=${langTag()}&platform=web"
+        val requestHeaders = LinkedHashMap(headers(true)).apply {
+            put("media-user-token", userToken)
+        }
+        val response = Http.request(
+            AppleConst.AMP + path,
+            if (favorite) "POST" else "DELETE",
+            requestHeaders,
+            null,
+            15000,
+            30000
+        )
+        if (response.code !in 200..299) {
+            throw IllegalStateException(
+                "${if (favorite) "收藏" else "取消收藏"}艺人失败，HTTP " +
+                    "${response.code}：${response.text.take(300)}"
+            )
+        }
+        Logx.i(
+            TAG,
+            "catalog artist ${if (favorite) "favorited" else "unfavorited"} " +
+                "(${response.code}): $artistId"
+        )
+    }
+
+    fun getCatalogArtistPage(artistId: String): AppleArtistPage {
+        require(artistId.matches(Regex("[A-Za-z0-9._-]+"))) { "无效的目录艺人 ID" }
+        val artist = getCatalogArtist(artistId)
+            ?: throw IllegalStateException("Apple Music 没有找到此艺人")
+        fun view(viewName: String, limit: Int? = null): JSONObject {
+            val limitQuery = limit?.let { "&limit=$it" }.orEmpty()
+            return JSONObject(
+                ampGet(
+                    "/v1/catalog/cn/artists/$artistId/view/$viewName" +
+                        "?l=zh-Hans-CN$limitQuery"
+                )
+            )
+        }
+        fun optionalView(viewName: String, limit: Int? = null): JSONObject? = try {
+            view(viewName, limit)
+        } catch (error: Exception) {
+            Logx.w(TAG, "艺人 $artistId 的 $viewName 视图不可用：${error.message}")
+            null
+        }
+
+        val topSongs = getCatalogArtistTopSongs(artistId, limit = 20)
+        val albums = getCatalogArtistAlbums(artistId, limit = 20, offset = 0)
+            .filterNot { it.isSingle }
+        val singles = optionalView("singles", 20)
+            ?.let { pickAlbums(it, "data", false) }
+            .orEmpty()
+            .onEach { it.catalogStorefront = "cn" }
+        val latestRelease = (albums + singles)
+            .maxByOrNull { it.releaseDate }
+        val videos = optionalView("music-videos", 12)
+            ?.let { pickAlbums(it, "data", false) }
+            .orEmpty()
+            .onEach { it.catalogStorefront = "cn" }
+        val playlists = optionalView("artist-playlists", 12)
+            ?.let { pickPlaylists(it, "data") }
+            .orEmpty()
+            .ifEmpty {
+                optionalView("playlists", 12)
+                    ?.let { pickPlaylists(it, "data") }
+                    .orEmpty()
+            }
+        val similarArtists = optionalView("similar-artists", 12)
+            ?.let { pickArtists(it, "data") }
+            .orEmpty()
+
+        topSongs.forEach { it.artistId = artist.id }
+        albums.forEach { it.artistId = artist.id }
+        singles.forEach { it.artistId = artist.id }
+        videos.forEach { it.artistId = artist.id }
+        return AppleArtistPage(
+            artist = artist,
+            topSongs = topSongs,
+            latestRelease = latestRelease?.also { it.artistId = artist.id },
+            albums = albums,
+            singles = singles,
+            musicVideos = videos,
+            playlists = playlists,
+            similarArtists = similarArtists
+        )
     }
 
     /** 目录歌曲所属的专辑 id。 */
-    fun getCatalogSongAlbumId(songId: String): String {
+    fun getCatalogSongAlbumId(songId: String, catalogStorefront: String = storefront): String {
         if (songId.isEmpty()) return ""
         return try {
-            val data = JSONObject(ampGet("/v1/catalog/$storefront/songs/$songId?include=albums&l=en-US"))
+            val language = if (catalogStorefront == "cn") "zh-Hans-CN" else langTag()
+            val data = JSONObject(
+                ampGet(
+                    "/v1/catalog/$catalogStorefront/songs/$songId" +
+                        "?include=albums&l=$language"
+                )
+            )
                 .optJSONArray("data") ?: return ""
             if (data.length() == 0) return ""
             data.getJSONObject(0).optJSONObject("relationships")
@@ -407,23 +908,98 @@ class AppleApi(private val prefs: TokenStore) {
         }
     }
 
+    /** Fetch the catalog album represented by a song's albums relationship. */
+    fun getCatalogAlbumForSong(
+        songId: String,
+        catalogStorefront: String = storefront
+    ): AppleAlbum? {
+        val albumId = getCatalogSongAlbumId(songId, catalogStorefront)
+        if (albumId.isBlank()) return null
+        return getCatalogAlbum(albumId, catalogStorefront)
+    }
+
+    fun getCatalogAlbum(albumId: String, catalogStorefront: String = storefront): AppleAlbum? {
+        if (albumId.isBlank()) return null
+        val language = if (catalogStorefront == "cn") "zh-Hans-CN" else langTag()
+        val data = JSONObject(
+            ampGet("/v1/catalog/$catalogStorefront/albums/$albumId?l=$language")
+        ).optJSONArray("data") ?: return null
+        return pickAlbums(JSONObject().put("data", data), "data", false).firstOrNull()
+            ?.also { it.catalogStorefront = catalogStorefront }
+    }
+
     /**
      * 目录专辑的曲目。
      * 注意：Apple 的 `albums/{id}?include=tracks` **不允许带 limit**
      * （会返回 400 "Limit may not be supplied on this request"）。
      */
-    fun getCatalogAlbumTracks(albumId: String): List<AppleSong> {
+    fun getCatalogAlbumTracks(
+        albumId: String,
+        catalogStorefront: String = storefront
+    ): List<AppleSong> {
         if (albumId.isEmpty()) return emptyList()
-        return try {
-            val data = JSONObject(ampGet("/v1/catalog/$storefront/albums/$albumId?include=tracks&l=en-US"))
-                .optJSONArray("data") ?: return emptyList()
-            if (data.length() == 0) return emptyList()
-            val tracks = data.getJSONObject(0).optJSONObject("relationships")?.optJSONObject("tracks")
-                ?: return emptyList()
-            pickSongs(tracks, "data", false)
-        } catch (e: Throwable) {
-            Logx.w(TAG, "getCatalogAlbumTracks failed $albumId: ${e.message}")
-            emptyList()
+        val language = if (catalogStorefront == "cn") "zh-Hans-CN" else langTag()
+        val data = JSONObject(
+            ampGet(
+                "/v1/catalog/$catalogStorefront/albums/$albumId" +
+                    "?include=tracks&l=$language"
+            )
+        ).optJSONArray("data") ?: error("Apple Music 没有返回专辑数据")
+        check(data.length() > 0) { "Apple Music 没有找到专辑：$albumId" }
+        val tracks = data.getJSONObject(0).optJSONObject("relationships")
+            ?.optJSONObject("tracks") ?: error("Apple Music 没有返回专辑曲目")
+        return pickSongs(tracks, "data", false).also {
+            localizeCatalogSongs(it, catalogStorefront)
+        }
+    }
+
+    private fun localizeCatalogSongs(
+        songs: MutableList<AppleSong>,
+        catalogStorefront: String = storefront
+    ) {
+        if (catalogStorefront != "cn" || songs.isEmpty()) return
+        val catalogIds = songs.map { it.catalogId.ifBlank { it.id } }
+            .filter(String::isNotBlank)
+            .distinct()
+        if (catalogIds.isEmpty()) return
+        try {
+            val data = JSONObject(
+                ampGet(
+                    "/v1/catalog/$catalogStorefront/songs?ids=${catalogIds.joinToString(",")}" +
+                        "&include=artists" +
+                        "&l=zh-Hans-CN"
+                )
+            ).optJSONArray("data") ?: return
+            val localized = HashMap<String, AppleSong>(data.length())
+            for (index in 0 until data.length()) {
+                val item = data.optJSONObject(index) ?: continue
+                val attributes = item.optJSONObject("attributes") ?: continue
+                val id = item.optString("id", "")
+                if (id.isBlank()) continue
+                localized[id] = AppleSong(
+                    id = id,
+                    name = attributes.optString("name", ""),
+                    artistName = attributes.optString("artistName", ""),
+                    albumName = attributes.optString("albumName", ""),
+                    artistId = item.optJSONObject("relationships")
+                        ?.optJSONObject("artists")
+                        ?.optJSONArray("data")
+                        ?.optJSONObject(0)
+                        ?.optString("id", "")
+                        .orEmpty()
+                )
+            }
+            songs.forEach { song ->
+                val localizedSong = localized[song.catalogId.ifBlank { song.id }] ?: return@forEach
+                if (localizedSong.name.isNotBlank()) song.name = localizedSong.name
+                if (localizedSong.artistName.isNotBlank()) {
+                    song.artistName = localizedSong.artistName
+                }
+                if (localizedSong.albumName.isNotBlank()) song.albumName = localizedSong.albumName
+                if (song.artistId.isBlank()) song.artistId = localizedSong.artistId
+            }
+        } catch (error: Exception) {
+            Logx.w(TAG, "catalog song localization failed: ${error.message}")
         }
     }
 
@@ -431,11 +1007,27 @@ class AppleApi(private val prefs: TokenStore) {
     fun librarySongCatalogId(libraryId: String): String {
         if (libraryId.isEmpty()) return ""
         return try {
-            val data = JSONObject(ampGet("/v1/me/library/songs/$libraryId?l=en-US")).optJSONArray("data")
-                ?: return ""
+            val root = JSONObject(
+                ampGet("/v1/me/library/songs/$libraryId?include=catalog&l=en-US")
+            )
+            val data = root.optJSONArray("data") ?: return ""
             if (data.length() == 0) return ""
-            data.getJSONObject(0).optJSONObject("attributes")?.optJSONObject("playParams")
-                ?.optString("catalogId", "") ?: ""
+            val song = data.getJSONObject(0)
+            val attributes = song.optJSONObject("attributes")
+            val playParamsId = attributes?.optJSONObject("playParams")
+                ?.optString("catalogId", "")
+                .orEmpty()
+            if (playParamsId.isNotBlank()) return playParamsId
+
+            val relationships = song.optJSONObject("relationships")
+            for (key in listOf("catalog", "catalog-songs")) {
+                val related = relationships?.optJSONObject(key)?.optJSONArray("data")
+                    ?.optJSONObject(0)
+                    ?.optString("id", "")
+                    .orEmpty()
+                if (related.isNotBlank()) return related
+            }
+            ""
         } catch (e: Throwable) {
             Logx.w(TAG, "librarySongCatalogId failed $libraryId: ${e.message}")
             ""
@@ -865,6 +1457,11 @@ class AppleApi(private val prefs: TokenStore) {
             s.name = attrs.optString("name", "")
             s.artistName = attrs.optString("artistName", "")
             s.albumName = attrs.optString("albumName", "")
+            val relationships = it.optJSONObject("relationships")
+            s.albumId = relationships?.optJSONObject("albums")
+                ?.optJSONArray("data")?.optJSONObject(0)?.optString("id", "").orEmpty()
+            s.artistId = relationships?.optJSONObject("artists")
+                ?.optJSONArray("data")?.optJSONObject(0)?.optString("id", "").orEmpty()
             s.trackNumber = attrs.optInt("trackNumber", 0)
             s.discNumber = attrs.optInt("discNumber", 0)
             s.isLibrary = isLibrary
@@ -915,6 +1512,7 @@ class AppleApi(private val prefs: TokenStore) {
             a.isSingle = attrs.optBoolean("isSingle", false)
             a.artworkUrl = bigArtwork(attrs.optJSONObject("artwork")?.optString("url", "") ?: "")
             val rd = attrs.optString("releaseDate", "")
+            a.releaseDate = rd
             if (rd.length >= 4) a.year = rd.substring(0, 4).toIntOrNull() ?: 0
             out.add(a)
         }
@@ -964,15 +1562,40 @@ class AppleApi(private val prefs: TokenStore) {
     /**
      * **主页**：个性化推荐货架。
      *
-     * `art[url]` + `platform=web` 是让服务端按「网页版首页」的版式返回，
-     * 不带这两个参数也能用，但货架会少一些（实测 13 个 → 更少）。
-     * 每个货架的形状见 [parseShelf]。
+     * 参数与网页版 listen-now 请求保持一致；资源以 JSON:API resource map 返回，
+     * 卡片内容及推荐理由由 [parseShelves] 从 resources 中解析。
      */
     fun getRecommendations(): List<Shelf> {
-        val txt = ampGet(
-            "/v1/me/recommendations?art%5Burl%5D=https%3A%2F%2Fmusic.apple.com%2F" +
-                    "&l=zh-Hans&platform=web"
-        )
+        val timezone = ZoneId.systemDefault().rules.getOffset(Instant.now()).id
+        val types = listOf(
+            "activities", "albums", "apple-curators", "artists", "concerts", "curators",
+            "editorial-items", "library-albums", "library-playlists", "music-movies",
+            "music-videos", "playlists", "social-profiles", "social-upsells", "songs",
+            "stations", "tv-episodes", "tv-shows", "uploaded-audios", "uploaded-videos"
+        ).joinToString("%2C")
+        val path = "/v1/me/recommendations?art%5Burl%5D=f" +
+                "&displayFilter%5Bkind%5D=" +
+                "MusicCircleCoverShelf%2CMusicConcertsEmptyShelf%2CMusicCoverGrid%2C" +
+                "MusicCoverShelf%2CMusicNotesHeroShelf%2CMusicSocialCardShelf%2C" +
+                "MusicSuperHeroShelf" +
+                "&extend=editorialArtwork%2CeditorialVideo%2CplainEditorialCard%2CplainEditorialNotes" +
+                "&extend%5Bplaylists%5D=artistNames" +
+                "&extend%5Bstations%5D=airTime%2CsupportsAirTimeUpdates" +
+                "&fields%5Bartists%5D=name%2Cartwork%2Curl" +
+                "&format%5Bresources%5D=map" +
+                "&include%5Balbums%5D=artists" +
+                "&include%5Blibrary-playlists%5D=catalog" +
+                "&include%5Bpersonal-recommendation%5D=primary-content" +
+                "&include%5Bstations%5D=radio-show" +
+                "&l=zh-Hans-CN" +
+                "&meta%5Bstations%5D=inflectionPoints" +
+                "&name=listen-now" +
+                "&omit%5Bresource%5D=autos" +
+                "&platform=web" +
+                "&timezone=${java.net.URLEncoder.encode(timezone, "UTF-8")}" +
+                "&types=$types" +
+                "&with=library"
+        val txt = ampGet(path)
         return parseShelves(JSONObject(txt))
     }
 
@@ -1036,9 +1659,11 @@ class AppleApi(private val prefs: TokenStore) {
 
     private fun parseShelves(root: JSONObject): List<Shelf> {
         val data = root.optJSONArray("data") ?: return emptyList()
+        val resources = root.optJSONObject("resources") ?: JSONObject()
         val out = ArrayList<Shelf>(data.length())
         for (i in 0 until data.length()) {
-            val s = data.optJSONObject(i) ?: continue
+            val reference = data.optJSONObject(i) ?: continue
+            val s = resolveResource(reference, resources)
             val attrs = s.optJSONObject("attributes") ?: JSONObject()
 
             // 标题：网页版是 {"stringForDisplay":"..."}，有时直接是字符串。
@@ -1054,7 +1679,8 @@ class AppleApi(private val prefs: TokenStore) {
             if (title.isEmpty()) continue
 
             val items = parseItems(
-                s.optJSONObject("relationships")?.optJSONObject("contents")?.optJSONArray("data")
+                s.optJSONObject("relationships")?.optJSONObject("contents")?.optJSONArray("data"),
+                resources
             )
             if (items.isEmpty()) continue
 
@@ -1075,18 +1701,93 @@ class AppleApi(private val prefs: TokenStore) {
     }
 
     /** 把货架上的原始条目转成 [ShelfItem]（封面统一换成 600x600）。 */
-    private fun parseItems(arr: JSONArray?): List<ShelfItem> {
+    private fun parseItems(
+        arr: JSONArray?,
+        resources: JSONObject = JSONObject()
+    ): List<ShelfItem> {
         if (arr == null) return emptyList()
         val out = ArrayList<ShelfItem>(arr.length())
         for (i in 0 until arr.length()) {
-            val it = arr.optJSONObject(i) ?: continue
+            val reference = arr.optJSONObject(i) ?: continue
+            val it = resolveResource(reference, resources)
             val attrs = it.optJSONObject("attributes") ?: continue
-            val type = it.optString("type", "")
+            val type = it.optString("type", reference.optString("type", ""))
             val name = attrs.optString("name", "")
             if (name.isEmpty()) continue
+            val songLike = attrs.has("artistName") &&
+                (attrs.has("durationInMillis") || attrs.has("playParams") || attrs.has("albumName"))
+            val catalogId = attrs.optJSONObject("playParams")
+                ?.optString("catalogId", "")
+                .orEmpty()
+                .ifBlank {
+                    it.optJSONObject("relationships")
+                        ?.optJSONObject("catalog")
+                        ?.optJSONArray("data")
+                        ?.optJSONObject(0)
+                        ?.optString("id", "")
+                        .orEmpty()
+                }
+            val relatedCatalogId = it.optJSONObject("relationships")
+                ?.optJSONObject("catalog")
+                ?.optJSONArray("data")
+                ?.optJSONObject(0)
+                ?.optString("id", "")
+                .orEmpty()
+            val descriptionValue = attrs.opt("description")
+            val collectionDescription = when (descriptionValue) {
+                is JSONObject -> descriptionValue.optString(
+                    "standard",
+                    descriptionValue.optString("stringForDisplay", "")
+                )
+                is String -> descriptionValue
+                else -> ""
+            }
+            val curatorId = it.optJSONObject("relationships")
+                ?.optJSONObject("curator")
+                ?.optJSONArray("data")
+                ?.optJSONObject(0)
+                ?.optString("id", "")
+                .orEmpty()
+            val relatedCuratorName = resources.optJSONObject("curators")
+                ?.optJSONObject(curatorId)
+                ?.optJSONObject("attributes")
+                ?.optString("name", "")
+                .orEmpty()
+            val creator = attrs.optString("curatorName", "").ifBlank {
+                relatedCuratorName
+            }.ifBlank {
+                attrs.optString("artistName", "")
+            }
+            val editorialVideo = attrs.optJSONObject("editorialVideo")
+            val motionArtwork = editorialVideo?.optJSONObject("motionDetailTall")
+                ?: editorialVideo?.optJSONObject("motionTallVideo3x4")
+                ?: editorialVideo?.optJSONObject("motionDetailSquare")
+            val squareMotionArtwork = editorialVideo?.optJSONObject("motionDetailSquare")
+            val motionPreview = motionArtwork?.optJSONObject("previewFrame")
+            val staticDetailArtwork = attrs.optJSONObject("editorialArtwork")
+                ?.optJSONObject("staticDetailTall")
+            val ratioSource = motionPreview ?: staticDetailArtwork
+            val artworkAspectRatio = if (ratioSource != null) {
+                val width = ratioSource.optDouble("width", 0.0)
+                val height = ratioSource.optDouble("height", 0.0)
+                if (width > 0.0 && height > 0.0) {
+                    (width / height).toFloat().coerceIn(0.5f, 2f)
+                } else {
+                    0.75f
+                }
+            } else {
+                0.75f
+            }
+            val reason = reference.optJSONObject("meta")
+                ?.optJSONObject("reason")
+                ?.optString("stringForDisplay", "")
+                .orEmpty()
             val subtitle = when (type) {
-                "albums", "songs" -> attrs.optString("artistName", "")
-                "playlists" -> attrs.optString("curatorName", "")
+                "albums", "songs", "library-songs" -> attrs.optString("artistName", "")
+                "playlists", "library-playlists" -> attrs.optJSONArray("artistNames")
+                    ?.let { names -> (0 until names.length()).map { names.optString(it) }.joinToString(", ") }
+                    ?.ifBlank { attrs.optString("curatorName", "") }
+                    ?: attrs.optString("curatorName", "")
                 "stations" -> attrs.optString("kind", "").let { k ->
                     when (k) {
                         "user" -> "个性化电台"
@@ -1104,11 +1805,50 @@ class AppleApi(private val prefs: TokenStore) {
                     type = type,
                     title = name,
                     subtitle = subtitle,
-                    artwork = bigArtwork(attrs.optJSONObject("artwork")?.optString("url", "") ?: "")
+                    artwork = bigArtwork(attrs.optJSONObject("artwork")?.optString("url", "") ?: ""),
+                    reason = reason,
+                    heroArtwork = tallArtwork(
+                        attrs.optJSONObject("editorialArtwork")
+                            ?.optJSONObject("superHeroTall")
+                            ?.optString("url", "")
+                            .orEmpty()
+                    ),
+                    catalogId = catalogId,
+                    songLike = songLike,
+                    relatedCatalogId = relatedCatalogId,
+                    collectionDescription = collectionDescription,
+                    creator = creator,
+                    trackCount = attrs.optInt("trackCount", 0),
+                    updatedAt = attrs.optString("lastModifiedDate", "")
+                        .ifBlank { attrs.optString("releaseDate", "") },
+                    ambientVideoUrl = motionArtwork?.optString("video", "").orEmpty(),
+                    ambientPreviewUrl = motionArtworkUrl(motionPreview, 600, 800),
+                    ambientSquareVideoUrl = squareMotionArtwork
+                        ?.optString("video", "")
+                        .orEmpty(),
+                    ambientSquarePreviewUrl = motionArtworkUrl(
+                        squareMotionArtwork?.optJSONObject("previewFrame"),
+                        600,
+                        600
+                    ),
+                    artworkAspectRatio = artworkAspectRatio
                 )
             )
         }
         return out
+    }
+
+    private fun resolveResource(reference: JSONObject, resources: JSONObject): JSONObject {
+        val type = reference.optString("type", "")
+        val id = reference.optString("id", "")
+        return resources.optJSONObject(type)?.optJSONObject(id) ?: reference
+    }
+
+    private fun tallArtwork(url: String): String {
+        if (url.isEmpty()) return ""
+        return url.replace("{w}", "600")
+            .replace("{h}", "800")
+            .replace("{f}", "jpg")
     }
 
     /**

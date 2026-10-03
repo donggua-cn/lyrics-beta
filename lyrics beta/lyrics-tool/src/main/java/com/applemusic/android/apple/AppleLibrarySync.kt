@@ -47,6 +47,7 @@ object AppleLibrarySync {
         var isLibrary = true
         /** 目录歌曲 id（换密钥必须用它） */
         var catalogId = ""
+        var artistId = ""
 
         fun toJson(): JSONObject = JSONObject().apply {
             put("appleId", appleId)
@@ -62,6 +63,7 @@ object AppleLibrarySync {
             put("discNumber", discNumber)
             put("isLibrary", isLibrary)
             put("catalogId", catalogId)
+            put("artistId", artistId)
         }
 
         companion object {
@@ -79,6 +81,7 @@ object AppleLibrarySync {
                 discNumber = o.optInt("discNumber", 0)
                 isLibrary = o.optBoolean("isLibrary", true)
                 catalogId = o.optString("catalogId", "")
+                artistId = o.optString("artistId", "")
             }
         }
     }
@@ -124,6 +127,7 @@ object AppleLibrarySync {
         genre = s.genre
         isLibrary = s.isLibrary
         catalogId = s.catalogId
+        artistId = s.artistId
     }
 
     /**

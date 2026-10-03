@@ -45,7 +45,9 @@ data class AppleAlbum(
     var year: Int = 0,
     var isLibrary: Boolean = false,
     /** Apple 标记：是否为单曲（用来分「专辑 / 单曲」两个板块） */
-    var isSingle: Boolean = false
+    var isSingle: Boolean = false,
+    var releaseDate: String = "",
+    var catalogStorefront: String = ""
 )
 
 data class AppleArtist(
@@ -53,7 +55,26 @@ data class AppleArtist(
     var name: String = "",
     var artworkUrl: String = "",
     var albumCount: Int = 0,
-    var songCount: Int = 0
+    var songCount: Int = 0,
+    var motionVideoUrl: String = "",
+    var motionPreviewUrl: String = "",
+    var motionBackgroundColor: String = "",
+    var motionTextColor: String = "",
+    var editorialDescription: String = "",
+    var bornOrFormed: String = "",
+    var isGroup: Boolean = false,
+    var genreNames: List<String> = emptyList()
+)
+
+data class AppleArtistPage(
+    val artist: AppleArtist,
+    val topSongs: List<AppleSong> = emptyList(),
+    val latestRelease: AppleAlbum? = null,
+    val albums: List<AppleAlbum> = emptyList(),
+    val singles: List<AppleAlbum> = emptyList(),
+    val musicVideos: List<AppleAlbum> = emptyList(),
+    val playlists: List<ApplePlaylist> = emptyList(),
+    val similarArtists: List<AppleArtist> = emptyList()
 )
 
 data class ApplePlaylist(

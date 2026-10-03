@@ -13,6 +13,8 @@ import com.applemusic.android.apple.AppleLibrarySync
 import com.applemusic.android.apple.MusicRepository
 import com.applemusic.android.util.Logx
 import java.io.File
+import org.json.JSONArray
+import org.json.JSONObject
 
 /**
  * 播放引擎。
@@ -34,6 +36,16 @@ object PlaybackEngine {
         private set
 
     private val main = Handler(Looper.getMainLooper())
+    private var appContext: Context? = null
+    private var restorePositionMs = 0L
+    private var restorePlayWhenReady = false
+    private var pendingPlaybackRestore = false
+    private val persistSnapshotRunnable = object : Runnable {
+        override fun run() {
+            persistQueueState()
+            if (isPlaying()) main.postDelayed(this, PERSIST_INTERVAL_MS)
+        }
+    }
 
     /** 队列（uri 形式）。 */
     private val queue = ArrayList<String>()
@@ -72,8 +84,14 @@ object PlaybackEngine {
      */
     var onQueueLow: ((remaining: Int) -> Unit)? = null
 
+    /** Called instead of wrapping to the first item when the current queue ends. */
+    var onQueueEnded: (() -> Boolean)? = null
+
     /** 水位：剩这么几首就提前去要下一批，避免播到断流。 */
-    private val QUEUE_LOW_WATER = 3
+    private val QUEUE_LOW_WATER = 4
+    private const val PLAYBACK_PREFERENCES = "playback_state"
+    private const val PLAYBACK_STATE_KEY = "queue_snapshot"
+    private const val PERSIST_INTERVAL_MS = 5_000L
 
     /**
      * 往队列**末尾**追加曲目（已有曲目不会重复添加）。
@@ -93,6 +111,7 @@ object PlaybackEngine {
             }
         }
         if (added > 0) {
+            persistQueueState()
             Logx.i(TAG, "队列续杯 +$added 首（现共 ${synchronized(queue) { queue.size }} 首）")
             onStateChanged?.invoke()
             val pendingIndex = synchronized(queue) {
@@ -148,6 +167,7 @@ object PlaybackEngine {
 
     fun init(context: Context) {
         if (player != null) return
+        appContext = context.applicationContext
         val p = ExoPlayer.Builder(context.applicationContext).build()
 
         // ═══════════════ 音频焦点（必须） ═══════════════
@@ -176,11 +196,17 @@ object PlaybackEngine {
                 if (playbackState == Player.STATE_ENDED) {
                     next()
                 }
+                persistQueueState()
                 onStateChanged?.invoke()
             }
 
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 Logx.i(TAG, "isPlaying=$isPlaying")
+                main.removeCallbacks(persistSnapshotRunnable)
+                persistQueueState()
+                if (isPlaying) {
+                    main.postDelayed(persistSnapshotRunnable, PERSIST_INTERVAL_MS)
+                }
                 onStateChanged?.invoke()
             }
 
@@ -210,6 +236,7 @@ object PlaybackEngine {
             }
         })
         player = p
+        restoreQueueState()
         Logx.i(TAG, "ExoPlayer 已初始化")
         registerMediaSession(context.applicationContext, p)
     }
@@ -360,6 +387,13 @@ object PlaybackEngine {
         return player?.isPlaying == true
     }
 
+    fun resumeRestoredPlayback() {
+        if (!pendingPlaybackRestore) return
+        val uri = synchronized(queue) { queue.getOrNull(queueIndex) } ?: return
+        pendingPlaybackRestore = false
+        prepareAndPlay(uri, restorePositionMs, restorePlayWhenReady)
+    }
+
     /** 用一列 uri 播放下标 index 的歌。 */
     fun playQueue(uris: List<String>, index: Int) {
         synchronized(queue) {
@@ -380,6 +414,7 @@ object PlaybackEngine {
     fun playAt(index: Int) {
         val uri = synchronized(queue) { queue.getOrNull(index) } ?: return
         queueIndex = index
+        persistQueueState()
         onStateChanged?.invoke()
         // 准备阶段就去检查水位：一首歌要下载十几秒，提前续杯能让切换无缝
         notifyIfQueueLow()
@@ -435,6 +470,7 @@ object PlaybackEngine {
             }
             return
         }
+        if (onQueueEnded?.invoke() == true) return
         val continuation = onQueueLow
         if (continuation != null) {
             synchronized(queue) { skipPendingForQueueContinuation = true }
@@ -455,6 +491,7 @@ object PlaybackEngine {
     fun toggle() {
         val p = player ?: return
         if (p.isPlaying) p.pause() else p.play()
+        persistQueueState()
         onStateChanged?.invoke()
     }
 
@@ -471,6 +508,7 @@ object PlaybackEngine {
                     "seekable=${p?.isCurrentMediaItemSeekable}"
         )
         p?.seekTo(ms)
+        persistQueueState()
         Logx.i(TAG, "seekTo 之后 requested=$ms actual=${p?.currentPosition} state=${p?.playbackState}")
         onStateChanged?.invoke()
     }
@@ -489,7 +527,11 @@ object PlaybackEngine {
      * 注意：下载 + 解密必须在后台线程（一首歌几秒到几十秒），
      * 而且同一首歌并发调用由 AppleCache 的 single-flight 兜住。
      */
-    private fun prepareAndPlay(uri: String) {
+    private fun prepareAndPlay(
+        uri: String,
+        resumePositionMs: Long = 0L,
+        playWhenReady: Boolean = true
+    ) {
         Logx.i(TAG, "prepareAndPlay 收到 uri=$uri")
         val song = MusicRepository.findSong(uri)
         if (song == null) {
@@ -556,11 +598,15 @@ object PlaybackEngine {
                             MediaItem.Builder().setUri(fileUri).setMediaMetadata(md).build()
                         )
                         p.prepare()
-                        p.play()
+                        if (resumePositionMs > 0L) p.seekTo(resumePositionMs)
+                        p.playWhenReady = playWhenReady
                         // 【关键】到这里才算「这首歌真的开始播了」，此时才提交当前曲目。
                         // 之前是在准备**之前**就改了 queueIndex，于是中途失败时
                         // 界面显示新歌、声音还是上一首 —— 用户看到的就是「歌名和声音对不上」。
                         playingIndex = wantIndex
+                        restorePlayWhenReady = false
+                        restorePositionMs = 0L
+                        persistQueueState()
                         preparingNote = ""
                         Logx.i(
                             TAG,
@@ -605,12 +651,81 @@ object PlaybackEngine {
             "播放失败，当前曲目回退到 index=$queueIndex，已标记坏条目" +
                     "（原因：$reason）"
         )
+        persistQueueState()
         onStateChanged?.invoke()
+    }
+
+    private fun restoreQueueState() {
+        val context = appContext ?: return
+        val encoded = context.getSharedPreferences(PLAYBACK_PREFERENCES, Context.MODE_PRIVATE)
+            .getString(PLAYBACK_STATE_KEY, null) ?: return
+        try {
+            val snapshot = JSONObject(encoded)
+            val uris = ArrayList<String>()
+            val rows = ArrayList<AppleLibrarySync.SongRow>()
+            val entries = snapshot.optJSONArray("items") ?: JSONArray()
+            for (index in 0 until entries.length()) {
+                val entry = entries.optJSONObject(index) ?: continue
+                val uri = entry.optString("uri", "")
+                if (uri.isEmpty()) continue
+                uris.add(uri)
+                entry.optJSONObject("song")?.let { rows.add(AppleLibrarySync.SongRow.fromJson(it)) }
+            }
+            if (uris.isEmpty()) return
+
+            MusicRepository.registerTransient(rows)
+            synchronized(queue) {
+                queue.clear()
+                queue.addAll(uris)
+            }
+            val selectedIndex = snapshot.optInt("queueIndex", -1).coerceIn(0, uris.lastIndex)
+            val restoredPlayingIndex = snapshot.optInt("playingIndex", selectedIndex)
+                .takeIf { it in uris.indices } ?: selectedIndex
+            queueIndex = selectedIndex
+            playingIndex = restoredPlayingIndex
+            restorePositionMs = snapshot.optLong("positionMs", 0L).coerceAtLeast(0L)
+            restorePlayWhenReady = snapshot.optBoolean("isPlaying", false)
+            pendingPlaybackRestore = true
+            Logx.i(TAG, "恢复播放队列 ${uris.size} 首，当前位置=$selectedIndex，续播=$restorePlayWhenReady")
+        } catch (error: Exception) {
+            Logx.e(TAG, "恢复播放队列失败：${error.message}", error)
+        }
+    }
+
+    private fun persistQueueState() {
+        val context = appContext ?: return
+        val uris = synchronized(queue) { queue.toList() }
+        val preferences = context.getSharedPreferences(PLAYBACK_PREFERENCES, Context.MODE_PRIVATE)
+        if (uris.isEmpty()) {
+            preferences.edit().remove(PLAYBACK_STATE_KEY).apply()
+            return
+        }
+
+        val items = JSONArray()
+        for (uri in uris) {
+            val entry = JSONObject().put("uri", uri)
+            MusicRepository.findSong(uri)?.let { entry.put("song", it.toJson()) }
+            items.put(entry)
+        }
+        val currentPosition = if (restorePositionMs > 0L) {
+            restorePositionMs
+        } else {
+            player?.currentPosition?.coerceAtLeast(0L) ?: 0L
+        }
+        val snapshot = JSONObject()
+            .put("items", items)
+            .put("queueIndex", queueIndex)
+            .put("playingIndex", playingIndex)
+            .put("positionMs", currentPosition)
+            .put("isPlaying", player?.playWhenReady ?: restorePlayWhenReady)
+        preferences.edit().putString(PLAYBACK_STATE_KEY, snapshot.toString()).apply()
     }
 
     private const val AppleCacheMin = 1L
 
     fun release() {
+        main.removeCallbacks(persistSnapshotRunnable)
+        persistQueueState()
         // 先释放会话再释放播放器：顺序反了会在系统侧留下一个指向已释放播放器的会话
         try {
             selfController?.release()

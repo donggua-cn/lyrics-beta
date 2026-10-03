@@ -5,10 +5,12 @@ import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Typeface
+import android.net.Uri
 import android.os.Build
 import android.provider.OpenableColumns
 import android.util.Log
 import android.view.MotionEvent
+import android.view.TextureView
 import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.webkit.ConsoleMessage
@@ -28,7 +30,9 @@ import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
@@ -52,6 +56,7 @@ import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -67,6 +72,7 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
@@ -77,7 +83,11 @@ import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -85,8 +95,13 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Explore
+import androidx.compose.material.icons.filled.GraphicEq
+import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.MoreHoriz
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Pause
@@ -95,11 +110,14 @@ import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Shuffle
+import androidx.compose.material.icons.filled.Sort
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.Translate
 import androidx.compose.material.icons.outlined.StarBorder
 import androidx.compose.material3.Button
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -114,6 +132,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
@@ -126,39 +145,64 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.FilterChip
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.State
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.blur
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.draw.drawWithCache
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.Velocity
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
+import androidx.recyclerview.widget.RecyclerView
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.webkit.WebViewAssetLoader
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.compose.ui.text.AnnotatedString
@@ -167,6 +211,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.lerp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogWindowProvider
@@ -177,6 +222,12 @@ import coil.request.ImageRequest
 import coil.request.ErrorResult
 import coil.request.SuccessResult
 import androidx.palette.graphics.Palette
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.Player
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.VideoSize
+import androidx.media3.exoplayer.ExoPlayer
 import kotlinx.coroutines.CancellationException
 import com.applemusic.lyricstool.data.AppleLyricsClient
 import com.applemusic.lyricstool.data.FetchedLyrics
@@ -185,14 +236,23 @@ import com.applemusic.lyricstool.data.QQMusicLyricsClient
 import com.applemusic.lyricstool.data.SongHit
 import org.json.JSONObject
 import com.applemusic.android.apple.AppleLibrarySync
+import com.applemusic.android.apple.AppleArtist
+import com.applemusic.android.apple.AppleArtistPage
+import com.applemusic.android.apple.AppleAlbum
+import com.applemusic.android.apple.ApplePlaylist
+import com.applemusic.android.apple.AppleSong
+import com.applemusic.android.apple.CollectionMetadata
 import com.applemusic.android.apple.AppleCache
 import com.applemusic.android.apple.MusicRepository
+import com.applemusic.android.apple.Shelf
+import com.applemusic.android.apple.ShelfItem
 import com.applemusic.android.player.MusicService
 import com.applemusic.android.player.PlaybackEngine
 import com.applemusic.android.player.LiveLyricsNotification
 import com.applemusic.android.lyrics.LyricsParser
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayInputStream
@@ -200,6 +260,7 @@ import java.io.File
 import java.io.FileInputStream
 import java.util.UUID
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.roundToInt
 
 @Composable
@@ -289,9 +350,37 @@ private enum class ExportFormat(val extension: String) {
 }
 
 private enum class ToolPage {
+    Home,
+    Collection,
+    Artist,
+    ArtistTopSongs,
     Search,
+    Discovery,
+    Radio,
+    Library,
     Settings
 }
+
+private data class HomeCollection(
+    val item: ShelfItem,
+    val tracks: List<AppleLibrarySync.SongRow>,
+    val metadata: CollectionMetadata? = null,
+    val metadataError: String? = null
+)
+
+private data class HomeCollectionCardTransition(
+    val item: ShelfItem,
+    val sourceBounds: Rect
+)
+
+private data class PendingHomePlayback(
+    val title: String,
+    val tracks: List<AppleLibrarySync.SongRow> = emptyList(),
+    val startIndex: Int = 0,
+    val stationId: String? = null,
+    val catalogArtistId: String? = null,
+    val shuffleArtistContinuation: Boolean = false
+)
 
 private data class LyricsAppearance(
     val highlightColor: String = "#6750A4",
@@ -476,6 +565,14 @@ internal fun LyricsToolScreen(
         val scope = rememberCoroutineScope()
         val clipboard = LocalClipboardManager.current
         val snackbar = remember { SnackbarHostState() }
+        val profilePreferences = remember(context) {
+            context.getSharedPreferences("user_profile", android.content.Context.MODE_PRIVATE)
+        }
+        var profileAvatarUri by remember(context) {
+            mutableStateOf(
+                profilePreferences.getString("avatar_uri", null)?.let(Uri::parse)
+            )
+        }
         var lyricsNotice by remember { mutableStateOf<String?>(null) }
         var query by remember { mutableStateOf("") }
         var songs by remember { mutableStateOf<List<SongHit>>(emptyList()) }
@@ -486,7 +583,53 @@ internal fun LyricsToolScreen(
         var favoritedSongIds by remember { mutableStateOf<Set<String>?>(null) }
         var favoriteStatusLoading by remember { mutableStateOf(false) }
         var favoritePendingSongId by remember { mutableStateOf<String?>(null) }
-        var selectedPage by remember { mutableStateOf(ToolPage.Search) }
+        var selectedPage by remember { mutableStateOf(ToolPage.Home) }
+        var lyricsReturnPage by remember { mutableStateOf(ToolPage.Home) }
+        var selectedCollection by remember { mutableStateOf<HomeCollection?>(null) }
+        var collectionReturnPage by remember { mutableStateOf(ToolPage.Home) }
+        var artistPage by remember { mutableStateOf<AppleArtistPage?>(null) }
+        val artistPageRecyclerState = rememberComposeRecyclerListState()
+        val artistSectionStateHolder = rememberSaveableStateHolder()
+        val artistTopSongsListState = rememberLazyListState()
+        val collectionListState = rememberLazyListState()
+        var artistPageHistory by remember { mutableStateOf<List<AppleArtistPage>>(emptyList()) }
+        var artistReturnPage by remember { mutableStateOf(ToolPage.Home) }
+        var artistPageLoading by remember { mutableStateOf(false) }
+        var artistPageError by remember { mutableStateOf<String?>(null) }
+        var artistTopSongs by remember { mutableStateOf<List<AppleSong>>(emptyList()) }
+        var artistTopSongsLoading by remember { mutableStateOf(false) }
+        var artistTopSongsHasMore by remember { mutableStateOf(false) }
+        var favoriteArtistIds by remember { mutableStateOf<Set<String>?>(null) }
+        var artistFavoriteOverride by remember { mutableStateOf<Boolean?>(null) }
+        var artistSavePending by remember { mutableStateOf(false) }
+        var collectionCardTransition by remember {
+            mutableStateOf<HomeCollectionCardTransition?>(null)
+        }
+        var rootWindowOrigin by remember { mutableStateOf(Offset.Zero) }
+        var stationStartPending by remember { mutableStateOf(false) }
+        var pendingHomePlayback by remember { mutableStateOf<PendingHomePlayback?>(null) }
+        var deferredRadio by remember { mutableStateOf<ShelfItem?>(null) }
+        var deferredRadioPrompt by remember { mutableStateOf<ShelfItem?>(null) }
+        var collectionLoading by remember { mutableStateOf(false) }
+        var collectionError by remember { mutableStateOf<String?>(null) }
+        val cachedHomeRecommendations = remember(context, client.userToken) {
+            HomeRecommendationsCache.read(context, client.userToken)
+        }
+        var homeShelves by remember(context, client.userToken) {
+            mutableStateOf(cachedHomeRecommendations?.shelves.orEmpty())
+        }
+        var homeLoading by remember { mutableStateOf(false) }
+        var homeError by remember { mutableStateOf<String?>(null) }
+        var homeRefreshKey by remember { mutableStateOf(0) }
+        var handledHomeRefreshKey by remember { mutableStateOf(0) }
+        var homeLastUpdatedAtMs by remember(context, client.userToken) {
+            mutableLongStateOf(cachedHomeRecommendations?.savedAtMs ?: 0L)
+        }
+        var homeScrolled by remember { mutableStateOf(false) }
+        var homeScrollStateInitialized by remember { mutableStateOf(false) }
+        var artistNavigationCollapsed by remember { mutableStateOf(false) }
+        val homeRecyclerState = rememberComposeRecyclerListState()
+        val homeSectionStateHolder = rememberSaveableStateHolder()
         var fullscreenLyrics by remember { mutableStateOf(false) }
         var lyricsNavigationVisible by remember { mutableStateOf(false) }
         var fetchedLyrics by remember { mutableStateOf<FetchedLyrics?>(null) }
@@ -551,6 +694,7 @@ internal fun LyricsToolScreen(
         var coverAccentColor by remember { mutableStateOf<String?>(null) }
         var coverAccentResolvedFor by remember { mutableStateOf<String?>(null) }
         var coverAccentColors by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
+        var miniPlayerArtworkAccent by remember { mutableStateOf<Color?>(null) }
         var pendingExport by remember { mutableStateOf<Pair<String, ExportFormat>?>(null) }
         var cacheManagerOpen by remember { mutableStateOf(false) }
         var cachedItems by remember { mutableStateOf<List<AppleCache.CacheItem>>(emptyList()) }
@@ -572,6 +716,62 @@ internal fun LyricsToolScreen(
         }
         val immersiveLyrics = lyricsFullscreenEnabled &&
             selectedSong != null && selectedPage == ToolPage.Search
+        val hideStatusBar = selectedPage != ToolPage.Search || immersiveLyrics
+        val statusBarHeight = remember(context) {
+            val resourceId = context.resources.getIdentifier(
+                "status_bar_height",
+                "dimen",
+                "android"
+            )
+            if (resourceId != 0) {
+                with(density) { context.resources.getDimensionPixelSize(resourceId).toDp() }
+            } else {
+                24.dp
+            }
+        }
+        DisposableEffect(view) {
+            val window = (context as? Activity)?.window
+            val controller = window?.let { WindowInsetsControllerCompat(it, view) }
+            val previousStatusBarColor = window?.statusBarColor
+            val previousLightStatusBar = controller?.isAppearanceLightStatusBars
+            val wasFullscreen = window?.let {
+                it.attributes.flags and
+                    android.view.WindowManager.LayoutParams.FLAG_FULLSCREEN != 0
+            } ?: false
+            if (window != null) {
+                WindowCompat.setDecorFitsSystemWindows(window, false)
+                window.clearFlags(
+                    android.view.WindowManager.LayoutParams.FLAG_TRANSLUCENT_STATUS
+                )
+                window.addFlags(
+                    android.view.WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS
+                )
+                window.statusBarColor = android.graphics.Color.TRANSPARENT
+                controller?.isAppearanceLightStatusBars = !appDarkTheme
+                controller?.systemBarsBehavior =
+                    WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                if (hideStatusBar) {
+                    controller?.hide(WindowInsetsCompat.Type.statusBars())
+                } else {
+                    controller?.show(WindowInsetsCompat.Type.statusBars())
+                }
+            }
+            onDispose {
+                if (window != null) {
+                    WindowCompat.setDecorFitsSystemWindows(window, true)
+                    previousStatusBarColor?.let { window.statusBarColor = it }
+                    previousLightStatusBar?.let {
+                        controller?.isAppearanceLightStatusBars = it
+                    }
+                    if (wasFullscreen) {
+                        window.addFlags(android.view.WindowManager.LayoutParams.FLAG_FULLSCREEN)
+                    } else {
+                        window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_FULLSCREEN)
+                    }
+                    controller?.show(WindowInsetsCompat.Type.statusBars())
+                }
+            }
+        }
         val playbackCardTopInset = remember(view, immersiveLyrics, density) {
             if (!immersiveLyrics) {
                 0.dp
@@ -607,27 +807,21 @@ internal fun LyricsToolScreen(
                 with(density) { fallbackTopPx.toDp() }
             }
         }
-        DisposableEffect(view, immersiveLyrics) {
+        SideEffect {
             val window = (context as? Activity)?.window
             val controller = window?.let { WindowInsetsControllerCompat(it, view) }
-            val wasFullscreen = window?.let {
-                it.attributes.flags and android.view.WindowManager.LayoutParams.FLAG_FULLSCREEN != 0
-            } ?: false
-            if (immersiveLyrics) {
+            window?.let { WindowCompat.setDecorFitsSystemWindows(it, false) }
+            if (hideStatusBar) {
                 window?.addFlags(android.view.WindowManager.LayoutParams.FLAG_FULLSCREEN)
-                controller?.systemBarsBehavior =
-                    WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-                controller?.hide(WindowInsetsCompat.Type.statusBars())
             } else {
                 window?.clearFlags(android.view.WindowManager.LayoutParams.FLAG_FULLSCREEN)
-                controller?.show(WindowInsetsCompat.Type.statusBars())
             }
-            onDispose {
-                if (wasFullscreen) {
-                    window?.addFlags(android.view.WindowManager.LayoutParams.FLAG_FULLSCREEN)
-                } else {
-                    window?.clearFlags(android.view.WindowManager.LayoutParams.FLAG_FULLSCREEN)
-                }
+            controller?.systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            if (hideStatusBar) {
+                controller?.hide(WindowInsetsCompat.Type.statusBars())
+            } else {
+                controller?.isAppearanceLightStatusBars = !appDarkTheme
                 controller?.show(WindowInsetsCompat.Type.statusBars())
             }
         }
@@ -641,7 +835,6 @@ internal fun LyricsToolScreen(
                 lyricsNavigationVisible = false
             }
         }
-
         LaunchedEffect(lyricsNotice) {
             if (lyricsNotice != null) {
                 delay(3_000L)
@@ -755,6 +948,7 @@ internal fun LyricsToolScreen(
         }
 
         fun openLyricsForSong(song: SongHit) {
+            if (selectedSong == null) lyricsReturnPage = selectedPage
             selectedPage = ToolPage.Search
             selectedSong = song
             lyricsCollapsed = false
@@ -788,6 +982,718 @@ internal fun LyricsToolScreen(
                 } finally {
                     if (selectedSong == song) loadingLyrics = false
                 }
+            }
+        }
+
+        fun resetCollectionScrollFor(item: ShelfItem) {
+            if (
+                selectedPage != ToolPage.Collection ||
+                selectedCollection?.item?.id != item.id
+            ) {
+                scope.launch { collectionListState.scrollToItem(0) }
+            }
+        }
+
+        fun openHomeCollection(item: ShelfItem) {
+            resetCollectionScrollFor(item)
+            if (selectedPage != ToolPage.Collection) {
+                collectionReturnPage = selectedPage
+            }
+            selectedPage = ToolPage.Collection
+            selectedCollection = HomeCollection(item = item, tracks = emptyList())
+            collectionError = null
+            collectionLoading = true
+            scope.launch {
+                try {
+                    val metadataResult = try {
+                        withContext(Dispatchers.IO) {
+                            MusicRepository.api.getRecommendedCollectionMetadata(item)
+                        } to null
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (error: Exception) {
+                        Log.w("CatalogCollectionPage", "无法读取《${item.title}》的完整详情", error)
+                        null to (error.message ?: "完整详情暂不可用")
+                    }
+                    val tracks = withContext(Dispatchers.IO) {
+                        if (item.isAlbum) {
+                            MusicRepository.api.getRecommendedAlbumTracks(
+                                albumId = item.id,
+                                relatedCatalogId = item.relatedCatalogId,
+                                isLibraryAlbum = item.type.contains("library", ignoreCase = true),
+                                resolvedCatalogId = metadataResult.first?.catalogId.orEmpty(),
+                                catalogStorefront = item.catalogStorefront.ifBlank {
+                                    MusicRepository.api.storefront
+                                }
+                            )
+                                .map { MusicRepository.rowOf(it).also { row -> row.isLibrary = false } }
+                        } else if (item.isPlaylist) {
+                            val rows = ArrayList<AppleLibrarySync.SongRow>()
+                            var offset = 0
+                            var expectedTotal = 0
+                            var pages = 0
+                            do {
+                                val page = MusicRepository.api.getRecommendedPlaylistTracks(
+                                    item.id,
+                                    item.relatedCatalogId,
+                                    item.isLibraryPlaylist,
+                                    100,
+                                    offset
+                                )
+                                expectedTotal = maxOf(expectedTotal, page.total)
+                                rows.addAll(
+                                    page.items.map {
+                                        MusicRepository.rowOf(it).also { row ->
+                                            row.isLibrary = false
+                                        }
+                                    }
+                                )
+                                offset += page.size()
+                                pages++
+                                if (page.size() < 100 || (expectedTotal > 0 && offset >= expectedTotal)) {
+                                    break
+                                }
+                            } while (pages < 20)
+                            check(expectedTotal == 0 || rows.size >= expectedTotal) {
+                                "歌单曲目尚未完整加载（已加载 ${rows.size} 首，共 $expectedTotal 首）"
+                            }
+                            rows
+                        } else {
+                            error("不支持打开此类型的内容：${item.type}")
+                        }
+                    }
+                    check(tracks.isNotEmpty()) { "Apple Music 没有返回《${item.title}》的曲目" }
+                    MusicRepository.registerTransient(tracks)
+                    selectedCollection = HomeCollection(
+                        item = item,
+                        tracks = tracks,
+                        metadata = metadataResult.first,
+                        metadataError = metadataResult.second
+                    )
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    collectionError = error.message ?: "无法加载曲目，请稍后重试"
+                } finally {
+                    collectionLoading = false
+                }
+            }
+        }
+
+        fun openHomeSongAlbum(item: ShelfItem) {
+            resetCollectionScrollFor(item)
+            collectionReturnPage = selectedPage
+            selectedPage = ToolPage.Collection
+            selectedCollection = HomeCollection(item = item, tracks = emptyList())
+            collectionError = null
+            collectionLoading = true
+            scope.launch {
+                try {
+                    val album = withContext(Dispatchers.IO) {
+                        val api = MusicRepository.api
+                        var catalogSongId = item.catalogId
+                        if (catalogSongId.isBlank() && item.isLibrarySong) {
+                            catalogSongId = api.librarySongCatalogId(item.id)
+                        }
+                        if (catalogSongId.isBlank() && !item.isLibrarySong) {
+                            catalogSongId = item.id
+                        }
+                        var matchedSong = if (catalogSongId.isNotBlank()) {
+                            api.getCatalogSongLocalized(catalogSongId)
+                        } else {
+                            null
+                        }
+                        if (matchedSong == null) {
+                            val search = api.search(item.title, 30)
+                            matchedSong = search.songs.firstOrNull { candidate ->
+                                candidate.name.equals(item.title, ignoreCase = true) &&
+                                    (item.subtitle.isBlank() ||
+                                        candidate.artistName.equals(
+                                            item.subtitle,
+                                            ignoreCase = true
+                                        ))
+                            }
+                        }
+                        val song = matchedSong
+                            ?: error("Apple Music 没有找到《${item.title}》对应的歌曲")
+                        api.getCatalogAlbumForSong(song.id)
+                            ?: error("Apple Music 没有返回《${item.title}》所属专辑")
+                    }
+                    openHomeCollection(
+                        ShelfItem(
+                            id = album.id,
+                            type = "albums",
+                            title = album.name,
+                            subtitle = album.artistName,
+                            artwork = album.artworkUrl.ifBlank { item.artwork }
+                        )
+                    )
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    collectionError = error.message ?: "无法打开歌曲所属专辑"
+                    collectionLoading = false
+                }
+            }
+        }
+
+        fun openCatalogArtist(
+            artistId: String,
+            artistName: String = "",
+            forceReload: Boolean = false
+        ) {
+            if (
+                !forceReload &&
+                selectedPage == ToolPage.Artist &&
+                artistPage?.artist?.id == artistId
+            ) {
+                return
+            }
+            if (
+                selectedPage == ToolPage.Artist &&
+                artistPage != null &&
+                (artistId.isBlank() || artistPage?.artist?.id != artistId)
+            ) {
+                artistPage?.let { artistPageHistory = artistPageHistory + it }
+            } else {
+                if (selectedPage != ToolPage.Artist) {
+                    artistPageHistory = emptyList()
+                    artistReturnPage = selectedPage
+                }
+            }
+            selectedPage = ToolPage.Artist
+            artistPage = if (artistId.isNotBlank()) {
+                artistPage?.takeIf { it.artist.id == artistId }
+            } else {
+                null
+            }
+            artistPageError = null
+            artistPageLoading = true
+            scope.launch {
+                try {
+                    val (loaded, savedArtists) = withContext(Dispatchers.IO) {
+                        val api = MusicRepository.api
+                        val resolvedId = artistId.ifBlank {
+                            api.searchArtistsOnly(artistName, 10)
+                                .firstOrNull {
+                                    it.name.equals(artistName, ignoreCase = true)
+                                }?.id.orEmpty()
+                        }
+                        require(resolvedId.isNotBlank()) {
+                            "Apple Music 没有找到艺人：$artistName"
+                        }
+                        val artistPage = api.getCatalogArtistPage(resolvedId)
+                        val favorites = api.getFavoriteCatalogArtistIds()
+                        artistPage to favorites
+                    }
+                    artistPage = loaded
+                    favoriteArtistIds = savedArtists
+                    artistFavoriteOverride = null
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    artistPageError = error.message ?: "无法加载艺人主页"
+                    Log.w("CatalogArtistPage", "加载艺人主页失败：$artistId", error)
+                } finally {
+                    artistPageLoading = false
+                }
+            }
+        }
+
+        fun loadMoreArtistTopSongs() {
+            val currentArtistPage = artistPage ?: return
+            if (
+                artistTopSongsLoading ||
+                !artistTopSongsHasMore ||
+                selectedPage != ToolPage.ArtistTopSongs
+            ) {
+                return
+            }
+            artistTopSongsLoading = true
+            scope.launch {
+                try {
+                    val offset = artistTopSongs.size
+                    val nextPage = withContext(Dispatchers.IO) {
+                        MusicRepository.api.getCatalogArtistTopSongs(
+                            currentArtistPage.artist.id,
+                            limit = 20,
+                            offset = offset
+                        )
+                    }
+                    artistTopSongs = (artistTopSongs + nextPage).distinctBy { it.id }
+                    artistTopSongsHasMore = nextPage.size >= 20
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    artistTopSongsHasMore = false
+                    snackbar.showSnackbar(
+                        error.message ?: "无法加载艺人热门歌曲"
+                    )
+                } finally {
+                    artistTopSongsLoading = false
+                }
+            }
+        }
+
+        fun openArtistTopSongs() {
+            val currentArtistPage = artistPage ?: return
+            selectedPage = ToolPage.ArtistTopSongs
+            artistTopSongs = currentArtistPage.topSongs
+            artistTopSongsHasMore = currentArtistPage.topSongs.size >= 20
+            artistTopSongsLoading = false
+        }
+
+        fun toggleArtistFavorite() {
+            val artist = artistPage?.artist ?: return
+            if (artistSavePending) return
+            val isCurrentlyFavorite = artistFavoriteOverride
+                ?: favoriteArtistIds?.contains(artist.id)
+                ?: false
+            val favorite = !isCurrentlyFavorite
+            artistSavePending = true
+            scope.launch {
+                try {
+                    withContext(Dispatchers.IO) {
+                        MusicRepository.api.setCatalogArtistFavorite(artist.id, favorite)
+                    }
+                    artistFavoriteOverride = favorite
+                    favoriteArtistIds = favoriteArtistIds?.let { current ->
+                        if (favorite) current + artist.id else current - artist.id
+                    }
+                    snackbar.showSnackbar(
+                        if (favorite) "已收藏艺人：${artist.name}"
+                        else "已取消收藏：${artist.name}"
+                    )
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    snackbar.showSnackbar(error.message ?: "无法更新艺人收藏状态")
+                } finally {
+                    artistSavePending = false
+                }
+            }
+        }
+
+        fun backFromArtistPage() {
+            val previous = artistPageHistory.lastOrNull()
+            if (previous == null) {
+                selectedPage = artistReturnPage
+            } else {
+                artistPageHistory = artistPageHistory.dropLast(1)
+                artistPage = previous
+                artistPageError = null
+                artistPageLoading = false
+                selectedPage = ToolPage.Artist
+            }
+        }
+
+        fun openArtistSongAlbum(song: AppleSong) {
+            resetCollectionScrollFor(
+                ShelfItem(
+                    id = song.albumId.ifBlank { song.id },
+                    type = "albums",
+                    title = song.albumName.ifBlank { song.name },
+                    subtitle = song.artistName,
+                    artwork = song.artworkUrl,
+                    catalogStorefront = "cn"
+                )
+            )
+            collectionReturnPage = selectedPage
+            selectedPage = ToolPage.Collection
+            selectedCollection = HomeCollection(
+                item = ShelfItem(
+                    id = song.albumId.ifBlank { song.id },
+                    type = "albums",
+                    title = song.albumName.ifBlank { song.name },
+                    subtitle = song.artistName,
+                    artwork = song.artworkUrl,
+                    catalogStorefront = "cn"
+                ),
+                tracks = emptyList()
+            )
+            collectionError = null
+            collectionLoading = true
+            scope.launch {
+                try {
+                    val album = withContext(Dispatchers.IO) {
+                        val api = MusicRepository.api
+                        if (song.albumId.isNotBlank()) {
+                            api.getCatalogAlbum(song.albumId, "cn")
+                        } else {
+                            api.getCatalogAlbumForSong(song.id, "cn")
+                        } ?: error("Apple Music 没有返回《${song.name}》所属专辑")
+                    }
+                    openHomeCollection(
+                        ShelfItem(
+                            id = album.id,
+                            type = "albums",
+                            title = album.name,
+                            subtitle = album.artistName,
+                            artwork = album.artworkUrl.ifBlank { song.artworkUrl },
+                            catalogStorefront = album.catalogStorefront.ifBlank {
+                                "cn"
+                            }
+                        )
+                    )
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    collectionError = error.message ?: "无法打开歌曲所属专辑"
+                    collectionLoading = false
+                }
+            }
+        }
+
+        fun openArtistAlbum(album: AppleAlbum) {
+            openHomeCollection(
+                ShelfItem(
+                    id = album.id,
+                    type = "albums",
+                    title = album.name,
+                    subtitle = album.artistName,
+                    artwork = album.artworkUrl,
+                    catalogStorefront = album.catalogStorefront
+                )
+            )
+        }
+
+        fun openArtistPlaylist(playlist: ApplePlaylist) {
+            openHomeCollection(
+                ShelfItem(
+                    id = playlist.id,
+                    type = "playlists",
+                    title = playlist.name,
+                    subtitle = "Apple Music",
+                    artwork = playlist.artworkUrl,
+                    trackCount = playlist.trackCount
+                )
+            )
+        }
+
+        fun openSongAlbumByRow(row: AppleLibrarySync.SongRow) {
+            scope.launch {
+                try {
+                    val album = withContext(Dispatchers.IO) {
+                        val api = MusicRepository.api
+                        val catalogSongId = row.catalogId.ifBlank {
+                            if (row.isLibrary) api.librarySongCatalogId(row.appleId)
+                            else row.appleId.ifBlank { row.uri.removePrefix("apple:") }
+                        }
+                        check(catalogSongId.isNotBlank()) { "当前歌曲缺少目录 ID" }
+                        api.getCatalogAlbumForSong(catalogSongId)
+                            ?: error("Apple Music 没有返回《${row.title}》所属专辑")
+                    }
+                    openArtistAlbum(album)
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    snackbar.showSnackbar(error.message ?: "无法打开歌曲所属专辑")
+                }
+            }
+        }
+
+        fun openPlayingSongAlbum() {
+            PlaybackEngine.currentSong()?.let(::openSongAlbumByRow)
+        }
+
+        fun openPlayingSongArtist() {
+            val row = PlaybackEngine.currentSong() ?: return
+            scope.launch {
+                try {
+                    val (artistId, artistName) = withContext(Dispatchers.IO) {
+                        val api = MusicRepository.api
+                        val catalogSongId = row.catalogId.ifBlank {
+                            if (row.isLibrary) api.librarySongCatalogId(row.appleId)
+                            else row.appleId.ifBlank { row.uri.removePrefix("apple:") }
+                        }
+                        val localizedSong = if (row.artistId.isBlank() && catalogSongId.isNotBlank()) {
+                            api.getCatalogSongLocalized(catalogSongId)
+                        } else {
+                            null
+                        }
+                        val searchArtistName = localizedSong?.artistName
+                            ?.takeIf(String::isNotBlank)
+                            ?: row.artist
+                        val artistId = row.artistId
+                            .ifBlank { localizedSong?.artistId.orEmpty() }
+                            .ifBlank {
+                                catalogSongId.takeIf(String::isNotBlank)
+                                    ?.let(api::getCatalogSongArtistId)
+                                    .orEmpty()
+                            }
+                            .ifBlank {
+                                api.searchArtistsOnly(searchArtistName, 10)
+                                .firstOrNull {
+                                    it.name.equals(searchArtistName, ignoreCase = true)
+                                }?.id.orEmpty()
+                            }
+                        artistId to searchArtistName
+                    }
+                    check(artistId.isNotBlank()) { "Apple Music 没有找到艺人：${row.artist}" }
+                    openCatalogArtist(artistId, artistName)
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    snackbar.showSnackbar(error.message ?: "无法打开艺人主页")
+                }
+            }
+        }
+
+        fun openCollectionTrackArtist(row: AppleLibrarySync.SongRow) {
+            scope.launch {
+                try {
+                    val (artistId, artistName) = withContext(Dispatchers.IO) {
+                        val api = MusicRepository.api
+                        val catalogSongId = row.catalogId.ifBlank {
+                            if (row.isLibrary) api.librarySongCatalogId(row.appleId)
+                            else row.appleId.ifBlank { row.uri.removePrefix("apple:") }
+                        }
+                        val localizedSong = if (row.artistId.isBlank() && catalogSongId.isNotBlank()) {
+                            api.getCatalogSongLocalized(catalogSongId)
+                        } else {
+                            null
+                        }
+                        val searchArtistName = localizedSong?.artistName
+                            ?.takeIf(String::isNotBlank)
+                            ?: row.artist
+                        val artistId = row.artistId
+                            .ifBlank { localizedSong?.artistId.orEmpty() }
+                            .ifBlank {
+                                catalogSongId.takeIf(String::isNotBlank)
+                                    ?.let(api::getCatalogSongArtistId)
+                                    .orEmpty()
+                            }
+                            .ifBlank {
+                                api.searchArtistsOnly(searchArtistName, 10)
+                                .firstOrNull {
+                                    it.name.equals(searchArtistName, ignoreCase = true)
+                                }?.id.orEmpty()
+                            }
+                        artistId to searchArtistName
+                    }
+                    check(artistId.isNotBlank()) { "Apple Music 没有找到艺人：${row.artist}" }
+                    openCatalogArtist(artistId, artistName)
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    snackbar.showSnackbar(error.message ?: "无法打开艺人主页")
+                }
+            }
+        }
+
+        fun openSongHitAlbum(song: SongHit) {
+            val knownRow = MusicRepository.findSong(song.id)
+                ?: MusicRepository.findSong("apple:${song.id}")
+            if (knownRow != null) {
+                openSongAlbumByRow(knownRow)
+                return
+            }
+            scope.launch {
+                try {
+                    val album = withContext(Dispatchers.IO) {
+                        val catalogSongId = song.providerSongId
+                            ?.takeIf(String::isNotBlank)
+                            ?: song.id
+                        MusicRepository.api.getCatalogAlbumForSong(catalogSongId)
+                            ?: error("Apple Music 没有返回《${song.title}》所属专辑")
+                    }
+                    openArtistAlbum(album)
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    snackbar.showSnackbar(error.message ?: "无法打开歌曲所属专辑")
+                }
+            }
+        }
+
+        fun openSongHitArtist(song: SongHit) {
+            val knownRow = MusicRepository.findSong(song.id)
+                ?: MusicRepository.findSong("apple:${song.id}")
+            if (knownRow != null) {
+                openCollectionTrackArtist(knownRow)
+                return
+            }
+            scope.launch {
+                try {
+                    val artistId = withContext(Dispatchers.IO) {
+                        val api = MusicRepository.api
+                        val catalogSongId = song.providerSongId
+                            ?.takeIf(String::isNotBlank)
+                            ?: song.id
+                        api.getCatalogSongArtistId(catalogSongId).ifBlank {
+                            api.searchArtistsOnly(song.artist, 10)
+                                .firstOrNull {
+                                    it.name.equals(song.artist, ignoreCase = true)
+                                }?.id.orEmpty()
+                        }
+                    }
+                    check(artistId.isNotBlank()) {
+                        "Apple Music 没有找到艺人：${song.artist}"
+                    }
+                    openCatalogArtist(artistId, song.artist)
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    snackbar.showSnackbar(error.message ?: "无法打开艺人主页")
+                }
+            }
+        }
+
+        fun startHomePlayback(request: PendingHomePlayback, replaceQueue: Boolean) {
+            if (stationStartPending) return
+            scope.launch {
+                try {
+                    if (request.stationId != null) {
+                        stationStartPending = true
+                        if (replaceQueue) {
+                            PlaybackEngine.onQueueLow = null
+                            PlaybackEngine.onQueueEnded = null
+                            deferredRadio = null
+                        }
+                        context.startService(Intent(context, MusicService::class.java))
+                        startRecommendedRadio(
+                            context.applicationContext,
+                            MusicRepository.api,
+                            request.stationId
+                        )
+                        snackbar.showSnackbar("已开始播放电台：${request.title}")
+                    } else {
+                        val tracks = request.tracks.drop(request.startIndex)
+                        check(tracks.isNotEmpty()) { "没有可播放的歌曲" }
+                        MusicRepository.registerTransient(tracks)
+                        context.startService(Intent(context, MusicService::class.java))
+                        if (replaceQueue) {
+                            PlaybackEngine.onQueueLow = null
+                            PlaybackEngine.onQueueEnded = null
+                            deferredRadio = null
+                            request.catalogArtistId?.let { artistId ->
+                                var nextOffset = request.tracks.size
+                                var requestInFlight = false
+                                var hasMore = true
+                                lateinit var artistQueueContinuation: (Int) -> Unit
+                                artistQueueContinuation = { remaining ->
+                                    if (remaining < 5 && hasMore && !requestInFlight) {
+                                        requestInFlight = true
+                                        scope.launch {
+                                            try {
+                                                val nextPage = withContext(Dispatchers.IO) {
+                                                    MusicRepository.api.getCatalogArtistTopSongs(
+                                                        artistId,
+                                                        limit = 20,
+                                                        offset = nextOffset
+                                                    )
+                                                }
+                                                if (
+                                                    PlaybackEngine.onQueueLow !==
+                                                    artistQueueContinuation
+                                                ) {
+                                                    return@launch
+                                                }
+                                                if (nextPage.isEmpty()) {
+                                                    hasMore = false
+                                                    PlaybackEngine.onQueueLow = null
+                                                    return@launch
+                                                }
+                                                val songs = if (
+                                                    request.shuffleArtistContinuation
+                                                ) {
+                                                    nextPage.shuffled()
+                                                } else {
+                                                    nextPage
+                                                }
+                                                val nextTracks = songs.map {
+                                                    MusicRepository.rowOf(it).also { row ->
+                                                        row.isLibrary = false
+                                                    }
+                                                }
+                                                MusicRepository.registerTransient(nextTracks)
+                                                PlaybackEngine.appendToQueue(
+                                                    nextTracks.map { it.uri }
+                                                )
+                                                nextOffset += nextPage.size
+                                                hasMore = nextPage.size >= 20
+                                                if (!hasMore) {
+                                                    PlaybackEngine.onQueueLow = null
+                                                }
+                                            } catch (error: CancellationException) {
+                                                throw error
+                                            } catch (error: Exception) {
+                                                if (
+                                                    PlaybackEngine.onQueueLow ===
+                                                    artistQueueContinuation
+                                                ) {
+                                                    snackbar.showSnackbar(
+                                                        error.message
+                                                            ?: "无法继续加载艺人热门歌曲"
+                                                    )
+                                                }
+                                            } finally {
+                                                requestInFlight = false
+                                            }
+                                        }
+                                    }
+                                }
+                                PlaybackEngine.onQueueLow = artistQueueContinuation
+                            }
+                            PlaybackEngine.playQueue(tracks.map { it.uri }, 0)
+                        } else {
+                            PlaybackEngine.appendToQueue(tracks.map { it.uri })
+                        }
+                        snackbar.showSnackbar(
+                            if (replaceQueue) "开始播放：${request.title}"
+                            else "已加入当前队列末尾：${request.title}"
+                        )
+                    }
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    snackbar.showSnackbar(
+                        "无法播放${request.title}：${error.message ?: error.javaClass.simpleName}"
+                    )
+                } finally {
+                    stationStartPending = false
+                }
+            }
+        }
+
+        fun requestHomePlayback(request: PendingHomePlayback) {
+            if (stationStartPending) return
+            if (PlaybackEngine.queueSnapshot().isNotEmpty() &&
+                PlaybackEngine.currentSong() != null
+            ) {
+                pendingHomePlayback = request
+            } else {
+                startHomePlayback(request, replaceQueue = true)
+            }
+        }
+
+        LaunchedEffect(deferredRadio?.id) {
+            val station = deferredRadio
+            PlaybackEngine.onQueueEnded = if (station == null) {
+                null
+            } else {
+                {
+                    deferredRadioPrompt = station
+                    true
+                }
+            }
+        }
+
+        LaunchedEffect(deferredRadioPrompt?.id) {
+            val station = deferredRadioPrompt ?: return@LaunchedEffect
+            val result = snackbar.showSnackbar(
+                message = "当前播放列表已结束，要开始播放电台“${station.title}”吗？",
+                actionLabel = "开始播放",
+                withDismissAction = true
+            )
+            deferredRadioPrompt = null
+            deferredRadio = null
+            PlaybackEngine.onQueueEnded = null
+            if (result == SnackbarResult.ActionPerformed) {
+                startHomePlayback(
+                    PendingHomePlayback(title = station.title, stationId = station.id),
+                    replaceQueue = true
+                )
             }
         }
 
@@ -846,6 +1752,39 @@ internal fun LyricsToolScreen(
                     )
                 } catch (error: Exception) {
                     lyricsNotice = "导入失败：${error.message ?: "请检查文件格式"}"
+                }
+            }
+
+        }
+
+        val selectProfileAvatar = rememberLauncherForActivityResult(
+            ActivityResultContracts.OpenDocument()
+        ) { uri ->
+            if (uri == null) return@rememberLauncherForActivityResult
+            try {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+                val previousAvatarUri = profileAvatarUri
+                profilePreferences.edit().putString("avatar_uri", uri.toString()).apply()
+                profileAvatarUri = uri
+                if (previousAvatarUri != null && previousAvatarUri != uri) {
+                    try {
+                        context.contentResolver.releasePersistableUriPermission(
+                            previousAvatarUri,
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION
+                        )
+                    } catch (error: SecurityException) {
+                        Log.w("LyricsToolScreen", "释放旧头像图片权限失败", error)
+                    }
+                }
+            } catch (error: Exception) {
+                Log.e("LyricsToolScreen", "保存个人头像访问权限失败", error)
+                scope.launch {
+                    snackbar.showSnackbar(
+                        "无法保存这张图片作为头像：${error.message ?: "请重新选择图片"}"
+                    )
                 }
             }
         }
@@ -1031,6 +1970,57 @@ internal fun LyricsToolScreen(
         val playbackAccentColor = coverAccentColor
             ?.let { runCatching { Color(android.graphics.Color.parseColor(it)) }.getOrNull() }
             ?: MaterialTheme.colorScheme.primary
+        LaunchedEffect(nowPlayingSong?.artworkUrl) {
+            val artworkUrl = nowPlayingSong?.artworkUrl.orEmpty()
+            miniPlayerArtworkAccent = null
+            if (artworkUrl.isBlank()) return@LaunchedEffect
+
+            val cachedAccent = coverAccentColors[artworkUrl]
+                ?.let { runCatching { Color(android.graphics.Color.parseColor(it)) }.getOrNull() }
+            if (cachedAccent != null) {
+                miniPlayerArtworkAccent = cachedAccent
+                return@LaunchedEffect
+            }
+
+            try {
+                val request = ImageRequest.Builder(context)
+                    .data(artworkUrl)
+                    .size(256)
+                    .allowHardware(false)
+                    .build()
+                val result = imageLoader.execute(request)
+                if (result is SuccessResult) {
+                    val bitmap = result.drawable.toBitmap()
+                    val swatch = withContext(Dispatchers.Default) {
+                        val palette = Palette.from(bitmap).generate()
+                        palette.vibrantSwatch
+                            ?: palette.darkVibrantSwatch
+                            ?: palette.lightVibrantSwatch
+                            ?: palette.mutedSwatch
+                            ?: palette.dominantSwatch
+                    }
+                    swatch?.let {
+                        val color = Color(it.rgb)
+                        miniPlayerArtworkAccent = color
+                        val encoded = "#%06X".format(Locale.US, 0xFFFFFF and it.rgb)
+                        coverAccentColors = coverAccentColors + (artworkUrl to encoded)
+                    } ?: Log.w(
+                        "MiniPlayerCapsule",
+                        "无法从正在播放歌曲的封面提取强调色"
+                    )
+                } else if (result is ErrorResult) {
+                    Log.w(
+                        "MiniPlayerCapsule",
+                        "无法加载正在播放歌曲的封面以提取强调色",
+                        result.throwable
+                    )
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                Log.w("MiniPlayerCapsule", "提取播放胶囊强调色失败", error)
+            }
+        }
 
         fun applyLyricsResult(song: SongHit, result: LyricsFetchResult) {
             if (selectedSong != song) return
@@ -1095,10 +2085,55 @@ internal fun LyricsToolScreen(
         LaunchedEffect(client) {
             try {
                 client.prepare()
+                PlaybackEngine.resumeRestoredPlayback()
+                restoreNativeRadioPrefetch(
+                    context.applicationContext,
+                    MusicRepository.api
+                )
             } catch (error: Exception) {
                 snackbar.showSnackbar(error.message ?: "连接 Apple Music 失败")
             } finally {
                 preparing = false
+            }
+        }
+
+        LaunchedEffect(signedIn, selectedPage, homeRefreshKey, client.userToken) {
+            if (selectedPage != ToolPage.Home) return@LaunchedEffect
+            if (!signedIn) {
+                homeShelves = emptyList()
+                homeError = null
+                return@LaunchedEffect
+            }
+            val explicitlyRequested = homeRefreshKey != handledHomeRefreshKey
+            if (
+                !explicitlyRequested &&
+                homeShelves.isNotEmpty() &&
+                HomeRecommendationsCache.isFresh(homeLastUpdatedAtMs)
+            ) {
+                return@LaunchedEffect
+            }
+            handledHomeRefreshKey = homeRefreshKey
+
+            homeLoading = true
+            homeError = null
+            try {
+                val recommendations = withContext(Dispatchers.IO) {
+                    MusicRepository.api.getRecommendations().also {
+                        HomeRecommendationsCache.write(
+                            context.applicationContext,
+                            client.userToken,
+                            it
+                        )
+                    }
+                }
+                homeShelves = recommendations
+                homeLastUpdatedAtMs = System.currentTimeMillis()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                homeError = error.message ?: "暂时无法加载个性化推荐"
+            } finally {
+                homeLoading = false
             }
         }
 
@@ -1229,37 +2264,91 @@ internal fun LyricsToolScreen(
             lyricsNavigationVisible = false
         }
 
-        BackHandler(enabled = selectedSong != null || selectedPage != ToolPage.Search) {
+        BackHandler(enabled = selectedSong != null || selectedPage != ToolPage.Home) {
             if (fullscreenLyrics) {
                 fullscreenLyrics = false
             } else if (lyricsCollapsed) {
                 lyricsCollapsed = false
-            } else if (selectedPage != ToolPage.Search) {
-                selectedPage = ToolPage.Search
-            } else {
+            } else if (selectedSong != null) {
                 selectedSong = null
+                selectedPage = lyricsReturnPage
                 fetchedLyrics = null
                 lyricsError = null
+            } else if (selectedPage == ToolPage.Artist) {
+                backFromArtistPage()
+            } else if (selectedPage == ToolPage.ArtistTopSongs) {
+                selectedPage = ToolPage.Artist
+            } else if (selectedPage == ToolPage.Collection) {
+                selectedPage = collectionReturnPage
+            } else if (selectedPage != ToolPage.Home) {
+                selectedPage = ToolPage.Home
             }
         }
 
         Scaffold(
-            containerColor = MaterialTheme.colorScheme.background,
+            containerColor = if (selectedPage == ToolPage.Home && appDarkTheme) {
+                Color(0xFF1C1C1E)
+            }
+            else MaterialTheme.colorScheme.background,
             contentWindowInsets = WindowInsets(0, 0, 0, 0),
             snackbarHost = { SnackbarHost(snackbar) }
         ) { padding ->
-            Box(
+            BoxWithConstraints(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(padding)
-                    .padding(
-                        top = if (immersiveLyrics) 0.dp
-                        else WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+                    .background(
+                        if (selectedPage == ToolPage.Home && appDarkTheme) Color(0xFF1C1C1E)
+                        else MaterialTheme.colorScheme.background
                     )
+                    .padding(padding)
+                    .onGloballyPositioned { rootWindowOrigin = it.positionInWindow() }
             ) {
+                val originalPlayerCapsuleWidth = (maxWidth - 32.dp)
+                    .coerceAtMost(360.dp)
+                    .coerceAtLeast(0.dp)
+                val collectionTransitionProgress = remember { Animatable(0f) }
+                LaunchedEffect(collectionCardTransition, selectedPage) {
+                    if (collectionCardTransition != null &&
+                        selectedPage == ToolPage.Collection
+                    ) {
+                        collectionTransitionProgress.snapTo(0f)
+                        collectionTransitionProgress.animateTo(
+                            1f,
+                            animationSpec = tween(durationMillis = 720)
+                        )
+                        while (collectionLoading) delay(16)
+                        delay(260)
+                        collectionCardTransition = null
+                    } else if (selectedPage != ToolPage.Collection) {
+                        collectionCardTransition = null
+                    }
+                }
+                if (selectedPage != ToolPage.Collection && !immersiveLyrics) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .fillMaxWidth()
+                            .height(statusBarHeight + 10.dp)
+                            .background(
+                                Brush.verticalGradient(
+                                    listOf(
+                                        if (appDarkTheme) Color(0xAA151517)
+                                        else Color(0x99FFFFFF),
+                                        if (appDarkTheme) Color(0x66151517)
+                                        else Color(0x55FFFFFF),
+                                        Color.Transparent
+                                    )
+                                )
+                            )
+                            .blur(6.dp)
+                    )
+                }
                 Column(
                         modifier = Modifier
                             .fillMaxSize()
+                            .padding(
+                                top = if (hideStatusBar) 0.dp else statusBarHeight
+                            )
                             .padding(
                                 bottom = WindowInsets.navigationBars.asPaddingValues()
                                     .calculateBottomPadding()
@@ -1268,35 +2357,7 @@ internal fun LyricsToolScreen(
                         AnimatedContent(
                             targetState = selectedPage,
                             transitionSpec = {
-                                val enteringFromRight = targetState == ToolPage.Settings
-                                (
-                                    slideInHorizontally(
-                                        animationSpec = spring(
-                                            dampingRatio = 0.88f,
-                                            stiffness = 420f
-                                        )
-                                    ) { width -> if (enteringFromRight) width else -width } +
-                                        fadeIn(animationSpec = tween(220)) +
-                                        scaleIn(
-                                            initialScale = 0.985f,
-                                            animationSpec = spring(
-                                                dampingRatio = 0.9f,
-                                                stiffness = 420f
-                                            )
-                                        )
-                                    ).togetherWith(
-                                        slideOutHorizontally(
-                                            animationSpec = spring(
-                                                dampingRatio = 0.9f,
-                                                stiffness = 420f
-                                            )
-                                        ) { width -> if (enteringFromRight) -width else width } +
-                                            fadeOut(animationSpec = tween(170)) +
-                                            scaleOut(
-                                                targetScale = 0.99f,
-                                                animationSpec = tween(170)
-                                            )
-                                    )
+                                fadeIn(tween(180)) togetherWith fadeOut(tween(140))
                             },
                             label = "pageNavigation",
                             modifier = Modifier.weight(1f)
@@ -1348,6 +2409,7 @@ internal fun LyricsToolScreen(
                                         } else {
                                             Text("搜索", fontWeight = FontWeight.Bold)
                                         }
+
                                 }
                             }
                         }
@@ -1465,6 +2527,64 @@ internal fun LyricsToolScreen(
                             )
                         }
 
+                        pendingHomePlayback?.let { request ->
+                            AlertDialog(
+                                onDismissRequest = { pendingHomePlayback = null },
+                                title = { Text("更改播放队列？") },
+                                text = {
+                                    Text(
+                                        "当前还有歌曲待播放。要现在播放“${request.title}”，" +
+                                            "还是等当前队列结束后再播放？"
+                                    )
+                                },
+                                confirmButton = {
+                                    TextButton(
+                                        onClick = {
+                                            pendingHomePlayback = null
+                                            startHomePlayback(request, replaceQueue = true)
+                                        }
+                                    ) {
+                                        Text("清空队列并播放")
+                                    }
+                                },
+                                dismissButton = {
+                                    Row {
+                                        TextButton(
+                                            onClick = { pendingHomePlayback = null }
+                                        ) {
+                                            Text("取消")
+                                        }
+                                        TextButton(
+                                            onClick = {
+                                                pendingHomePlayback = null
+                                                if (request.stationId != null) {
+                                                    deferredRadio = ShelfItem(
+                                                        id = request.stationId,
+                                                        type = "stations",
+                                                        title = request.title,
+                                                        subtitle = "电台",
+                                                        artwork = ""
+                                                    )
+                                                    scope.launch {
+                                                        snackbar.showSnackbar(
+                                                            "电台将在当前队列结束后询问是否开始；暂不预取歌曲"
+                                                        )
+                                                    }
+                                                } else {
+                                                    startHomePlayback(
+                                                        request,
+                                                        replaceQueue = false
+                                                    )
+                                                }
+                                            }
+                                        ) {
+                                            Text("当前队列后播放")
+                                        }
+                                    }
+                                }
+                            )
+                        }
+
                         if (lyricsAppearanceOpen) {
                             LyricsAppearanceDialog(
                                 appearance = lyricsAppearance,
@@ -1494,6 +2614,7 @@ internal fun LyricsToolScreen(
                         if (page == ToolPage.Settings && !fullscreenLyrics) {
                             SettingsPage(
                                 signedIn = signedIn,
+                                profileAvatarUri = profileAvatarUri,
                                 cacheCount = cachedItems.size,
                                 cacheBytes = cachedItems.sumOf { it.size },
                                 statusBarLyricsEnabled = statusBarLyricsEnabled,
@@ -1503,6 +2624,27 @@ internal fun LyricsToolScreen(
                                 manualThemeSeedHex = manualThemeSeedHex,
                                 modifier = Modifier.weight(1f),
                                 onLogin = openLogin,
+                                onSelectProfileAvatar = {
+                                    selectProfileAvatar.launch(arrayOf("image/*"))
+                                },
+                                onClearProfileAvatar = {
+                                    profileAvatarUri?.let { uri ->
+                                        try {
+                                            context.contentResolver.releasePersistableUriPermission(
+                                                uri,
+                                                Intent.FLAG_GRANT_READ_URI_PERMISSION
+                                            )
+                                        } catch (error: SecurityException) {
+                                            Log.w(
+                                                "LyricsToolScreen",
+                                                "释放头像图片权限失败",
+                                                error
+                                            )
+                                        }
+                                    }
+                                    profileAvatarUri = null
+                                    profilePreferences.edit().remove("avatar_uri").apply()
+                                },
                                 onThemeModeChange = { mode ->
                                     themeMode = mode
                                     themePreferences.edit()
@@ -1549,6 +2691,310 @@ internal fun LyricsToolScreen(
                                     )
                                 }
                             )
+                        } else if (page == ToolPage.Home && selectedSong == null) {
+                            MusicHomePage(
+                                shelves = homeShelves,
+                                profileAvatarUri = profileAvatarUri,
+                                darkTheme = appDarkTheme,
+                                statusBarHeight = statusBarHeight,
+                                isSignedIn = signedIn,
+                                isLoading = homeLoading,
+                                error = homeError,
+                                onSettings = { selectedPage = ToolPage.Settings },
+                                onRefresh = { homeRefreshKey++ },
+                                recyclerState = homeRecyclerState,
+                                sectionStateHolder = homeSectionStateHolder,
+                                onScrollChanged = { isCollapsed, isInitial ->
+                                    if (!isInitial || !homeScrollStateInitialized) {
+                                        if (homeScrolled != isCollapsed) {
+                                            homeScrolled = isCollapsed
+                                        }
+                                    }
+                                    if (!homeScrollStateInitialized) {
+                                        homeScrollStateInitialized = true
+                                    }
+                                },
+                                onOpenItem = { item, cardBounds ->
+                                    when {
+                                        item.isStation -> requestHomePlayback(
+                                            PendingHomePlayback(
+                                                title = item.title,
+                                                stationId = item.id
+                                            )
+                                        )
+                                        item.isArtist -> openCatalogArtist(item.id, item.title)
+                                        item.isAlbum || item.isPlaylist -> {
+                                            collectionCardTransition =
+                                                HomeCollectionCardTransition(
+                                                    item,
+                                                    cardBounds
+                                                )
+                                            openHomeCollection(item)
+                                        }
+                                        item.isSong -> {
+                                            collectionCardTransition =
+                                                HomeCollectionCardTransition(
+                                                    item,
+                                                    cardBounds
+                                                )
+                                            openHomeSongAlbum(item)
+                                        }
+                                        else -> scope.launch {
+                                            snackbar.showSnackbar(
+                                                "暂不支持打开此类型的内容：${item.title}（类型：${item.type}）"
+                                            )
+                                        }
+                                    }
+                                },
+                                modifier = Modifier.weight(1f)
+                            )
+                        } else if (page == ToolPage.Artist) {
+                            CatalogArtistPage(
+                                page = artistPage,
+                                recyclerState = artistPageRecyclerState,
+                                sectionStateHolder = artistSectionStateHolder,
+                                isLoading = artistPageLoading,
+                                error = artistPageError,
+                                statusBarHeight = statusBarHeight,
+                                bottomPadding = WindowInsets.navigationBars.asPaddingValues()
+                                    .calculateBottomPadding(),
+                                onBack = ::backFromArtistPage,
+                                onScrollChanged = { isCollapsed, isInitial ->
+                                    if (isInitial || artistNavigationCollapsed != isCollapsed) {
+                                        artistNavigationCollapsed = isCollapsed
+                                    }
+                                },
+                                onShare = {
+                                    artistPage?.artist?.let { artist ->
+                                        val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                                            type = "text/plain"
+                                            putExtra(
+                                                Intent.EXTRA_TEXT,
+                                                "https://music.apple.com/${MusicRepository.api.storefront}/artist/${artist.id}"
+                                            )
+                                        }
+                                        context.startActivity(
+                                            Intent.createChooser(shareIntent, artist.name)
+                                        )
+                                    }
+                                },
+                                onRetry = {
+                                    artistPage?.artist?.let {
+                                        openCatalogArtist(it.id, it.name, forceReload = true)
+                                    }
+                                },
+                                onOpenTopSongs = ::openArtistTopSongs,
+                                isArtistFavorite = artistFavoriteOverride
+                                    ?: artistPage?.artist?.id?.let {
+                                        favoriteArtistIds?.contains(it)
+                                    },
+                                artistSavePending = artistSavePending,
+                                onToggleArtistFavorite = ::toggleArtistFavorite,
+                                onPlay = {
+                                    val artist = artistPage ?: return@CatalogArtistPage
+                                    val rows = artist.topSongs.map {
+                                        MusicRepository.rowOf(it).also { row ->
+                                            row.isLibrary = false
+                                        }
+                                    }
+                                    if (rows.isNotEmpty()) {
+                                        startHomePlayback(
+                                            PendingHomePlayback(
+                                                title = artist.artist.name,
+                                                tracks = rows,
+                                                catalogArtistId = artist.artist.id
+                                            ),
+                                            replaceQueue = true
+                                        )
+                                    }
+                                },
+                                onShuffle = {
+                                    artistPage?.let { artist ->
+                                        val rows = artist.topSongs.shuffled().map {
+                                            MusicRepository.rowOf(it).also { row ->
+                                                row.isLibrary = false
+                                            }
+                                        }
+                                        if (rows.isNotEmpty()) {
+                                            startHomePlayback(
+                                                PendingHomePlayback(
+                                                    title = artist.artist.name,
+                                                    tracks = rows,
+                                                    catalogArtistId = artist.artist.id,
+                                                    shuffleArtistContinuation = true
+                                                ),
+                                                replaceQueue = true
+                                            )
+                                        }
+                                    }
+                                },
+                                onPlaySong = { song ->
+                                    startHomePlayback(
+                                        PendingHomePlayback(
+                                            title = song.name,
+                                            tracks = listOf(
+                                                MusicRepository.rowOf(song).also {
+                                                    it.isLibrary = false
+                                                }
+                                            )
+                                        ),
+                                        replaceQueue = true
+                                    )
+                                },
+                                onOpenSongAlbum = ::openArtistSongAlbum,
+                                onOpenArtist = { artist ->
+                                    openCatalogArtist(artist.id, artist.name)
+                                },
+                                onOpenAlbum = ::openArtistAlbum,
+                                onAddAlbum = { album ->
+                                    scope.launch {
+                                        try {
+                                            val added = withContext(Dispatchers.IO) {
+                                                MusicRepository.api.addCatalogAlbumToLibrary(album.id)
+                                            }
+                                            snackbar.showSnackbar(
+                                                if (added) "已添加《${album.name}》到资料库"
+                                                else "添加《${album.name}》到资料库失败"
+                                            )
+                                        } catch (error: CancellationException) {
+                                            throw error
+                                        } catch (error: Exception) {
+                                            snackbar.showSnackbar(
+                                                error.message ?: "添加专辑到资料库失败"
+                                            )
+                                        }
+                                    }
+                                },
+                                onOpenPlaylist = ::openArtistPlaylist,
+                                modifier = Modifier.weight(1f)
+                            )
+                        } else if (page == ToolPage.ArtistTopSongs) {
+                            CatalogArtistTopSongsPage(
+                                artist = artistPage?.artist,
+                                listState = artistTopSongsListState,
+                                songs = artistTopSongs,
+                                isLoading = artistTopSongsLoading,
+                                hasMore = artistTopSongsHasMore,
+                                onLoadMore = ::loadMoreArtistTopSongs,
+                                onBack = { selectedPage = ToolPage.Artist },
+                                onPlaySong = { song ->
+                                    startHomePlayback(
+                                        PendingHomePlayback(
+                                            title = song.name,
+                                            tracks = listOf(
+                                                MusicRepository.rowOf(song).also {
+                                                    it.isLibrary = false
+                                                }
+                                            )
+                                        ),
+                                        replaceQueue = true
+                                    )
+                                },
+                                onOpenSongAlbum = ::openArtistSongAlbum,
+                                onOpenArtist = { artist ->
+                                    openCatalogArtist(artist.id, artist.name)
+                                },
+                                modifier = Modifier.weight(1f)
+                            )
+                        } else if (page == ToolPage.Collection) {
+                            AnimatedContent(
+                                targetState = collectionLoading,
+                                transitionSpec = {
+                                    fadeIn(tween(260)) togetherWith fadeOut(tween(180))
+                                },
+                                label = "collectionContentLoading"
+                            ) { showingCollectionLoading ->
+                                CatalogCollectionPage(
+                                collection = selectedCollection,
+                                listState = collectionListState,
+                                isLoading = showingCollectionLoading,
+                                error = collectionError,
+                                onBack = { selectedPage = collectionReturnPage },
+                                onSearch = { selectedPage = ToolPage.Search },
+                                onPlayTrack = { index ->
+                                    val collection = selectedCollection ?: return@CatalogCollectionPage
+                                    requestHomePlayback(
+                                        PendingHomePlayback(
+                                            title = collection.item.title,
+                                            tracks = collection.tracks,
+                                            startIndex = index
+                                        )
+                                    )
+                                },
+                                onShuffle = {
+                                    val collection = selectedCollection ?: return@CatalogCollectionPage
+                                    requestHomePlayback(
+                                        PendingHomePlayback(
+                                            title = collection.item.title,
+                                            tracks = collection.tracks.shuffled()
+                                        )
+                                    )
+                                },
+                                onDownload = {
+                                    val collection = selectedCollection ?: return@CatalogCollectionPage
+                                    scope.launch {
+                                        var completed = 0
+                                        val failures = mutableListOf<String>()
+                                        collection.tracks.forEach { row ->
+                                            try {
+                                                withContext(Dispatchers.IO) {
+                                                    val songId = row.appleId.ifBlank { row.catalogId }
+                                                        .ifBlank { row.uri }
+                                                    require(songId.isNotBlank()) {
+                                                        "《${row.title}》缺少可下载的歌曲 ID"
+                                                    }
+                                                    MusicRepository.cache.ensure(
+                                                        songId = songId,
+                                                        isLibrary = row.isLibrary,
+                                                        metadata = com.applemusic.android.apple.AppleCache.SongMetadata(
+                                                            title = row.title,
+                                                            artist = row.artist,
+                                                            album = row.album
+                                                        )
+                                                    )
+                                                }
+                                                completed++
+                                            } catch (error: CancellationException) {
+                                                throw error
+                                            } catch (error: Exception) {
+                                                failures += "${row.title}: ${error.message ?: "下载失败"}"
+                                            }
+                                        }
+                                        val message = if (failures.isEmpty()) {
+                                            "已下载 ${completed} 首歌曲"
+                                        } else {
+                                            "已下载 ${completed} 首，${failures.size} 首失败：${failures.take(2).joinToString("；")}"
+                                        }
+                                        snackbar.showSnackbar(message)
+                                    }
+                                },
+                                onOpenAlbum = ::openSongAlbumByRow,
+                                onOpenArtist = ::openCollectionTrackArtist,
+                                playingSong = nowPlayingSong,
+                                isPlaybackPlaying = playbackIsPlaying
+                            )
+                            }
+                        } else if (
+                            page == ToolPage.Discovery ||
+                            page == ToolPage.Radio ||
+                            page == ToolPage.Library
+                        ) {
+                            val title = when (page) {
+                                ToolPage.Discovery -> "新发现"
+                                ToolPage.Radio -> "电台"
+                                else -> "资料库"
+                            }
+                            Box(
+                                modifier = Modifier.weight(1f).fillMaxWidth()
+                                    .background(MaterialTheme.colorScheme.background),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    "$title · 即将推出",
+                                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.56f),
+                                    style = MaterialTheme.typography.bodyMedium
+                                )
+                            }
                         } else {
                             AnimatedContent(
                                 targetState = selectedSong != null,
@@ -1594,6 +3040,8 @@ internal fun LyricsToolScreen(
                                                 },
                                                 onLogin = openLogin,
                                                 onOpenQueue = { queueDialogOpen = true },
+                                                onOpenAlbum = { openSongHitAlbum(song) },
+                                                onOpenArtist = { openSongHitArtist(song) },
                                                 onQueueDragOffsetChange = {
                                                     coverQueueDragOffset = it
                                                 },
@@ -1837,10 +3285,15 @@ internal fun LyricsToolScreen(
                                         searching = searching,
                                         query = query,
                                         lyricMatches = lyricSearchUsed,
+                                        onOpenAlbum = ::openSongHitAlbum,
+                                        onOpenArtist = ::openSongHitArtist,
                                         onSongClick = { song ->
                                             sourceLookupRequest = 0
                                             fullscreenLyrics = false
                                             lyricsCollapsed = false
+                                            if (selectedSong == null) {
+                                                lyricsReturnPage = selectedPage
+                                            }
                                             selectedSong = song
                                             fetchedLyrics = null
                                             loadingLyrics = true
@@ -1920,33 +3373,31 @@ internal fun LyricsToolScreen(
                     }
                 }
 
-                AnimatedVisibility(
-                    visible = nowPlayingSong != null &&
-                        selectedSong == null &&
-                        !fullscreenLyrics,
-                    enter = fadeIn() + slideInVertically(initialOffsetY = { it / 2 }),
-                    exit = fadeOut() + slideOutVertically(targetOffsetY = { it / 2 }),
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .padding(horizontal = 16.dp)
-                        .padding(
-                            bottom = WindowInsets.navigationBars.asPaddingValues()
-                                .calculateBottomPadding() + 84.dp
-                        )
-                ) {
-                    nowPlayingSong?.let { song ->
-                        MiniPlayerCapsule(
-                            song = song,
-                            isPlaying = playbackIsPlaying,
-                            positionMs = playbackPositionMs,
-                            durationMs = playbackDurationMs,
-                            onOpen = { openLyricsForSong(song) },
-                            onTogglePlayback = { PlaybackEngine.toggle() },
-                            onNext = { PlaybackEngine.next() },
-                            onPrevious = { PlaybackEngine.prev() }
-                        )
-                    }
-                }
+                val navigationShouldCollapse = nowPlayingSong != null &&
+                    ((selectedPage == ToolPage.Home && homeScrolled) ||
+                        (selectedPage == ToolPage.Artist && artistNavigationCollapsed))
+                val navigationCollapseProgress = animateFloatAsState(
+                    targetValue = if (navigationShouldCollapse) 1f else 0f,
+                    animationSpec = spring(dampingRatio = 0.88f, stiffness = 220f),
+                    label = "navigationCollapseProgress"
+                )
+                CollapsingMiniPlayer(
+                    song = nowPlayingSong,
+                    visible = selectedSong == null && !fullscreenLyrics,
+                    isPlaying = playbackIsPlaying,
+                    positionMs = playbackPositionMs,
+                    durationMs = playbackDurationMs,
+                    progress = navigationCollapseProgress,
+                    expandedWidth = originalPlayerCapsuleWidth,
+                    artworkAccent = miniPlayerArtworkAccent,
+                    onOpen = { song -> openLyricsForSong(song) },
+                    onOpenAlbum = ::openPlayingSongAlbum,
+                    onOpenArtist = ::openPlayingSongArtist,
+                    onTogglePlayback = { PlaybackEngine.toggle() },
+                    onNext = { PlaybackEngine.next() },
+                    onPrevious = { PlaybackEngine.prev() },
+                    modifier = Modifier.align(Alignment.BottomCenter)
+                )
 
                 AnimatedVisibility(
                     visible = lyricsCollapsed && selectedSong != null,
@@ -2018,6 +3469,50 @@ internal fun LyricsToolScreen(
                             }
                         }
                     }
+
+                collectionCardTransition?.let { transition ->
+                        val progress = collectionTransitionProgress.value
+                        val artworkAlpha by animateFloatAsState(
+                            targetValue = if (progress >= 1f && !collectionLoading) 0f else 1f,
+                            animationSpec = tween(260),
+                            label = "collectionArtworkTransitionFade"
+                        )
+                        val targetWidthPx = with(density) { maxWidth.toPx() }
+                        val targetHeightPx = with(density) { maxHeight.toPx() }
+                        val sourceBounds = transition.sourceBounds
+                        val sourceLeft = sourceBounds.left - rootWindowOrigin.x
+                        val sourceTop = sourceBounds.top - rootWindowOrigin.y
+                        val currentWidth = sourceBounds.width +
+                            (targetWidthPx - sourceBounds.width) * progress
+                        val currentHeight = sourceBounds.height +
+                            (targetHeightPx - sourceBounds.height) * progress
+                        val currentLeft = sourceLeft * (1f - progress)
+                        val currentTop = sourceTop * (1f - progress)
+                        val artwork = transition.item.heroArtwork
+                            .ifBlank { transition.item.artwork }
+                        Box(
+                            modifier = Modifier
+                                .offset {
+                                    IntOffset(currentLeft.roundToInt(), currentTop.roundToInt())
+                                }
+                                .size(
+                                    with(density) { currentWidth.toDp() },
+                                    with(density) { currentHeight.toDp() }
+                                )
+                                .clip(RoundedCornerShape(lerp(20.dp, 0.dp, progress)))
+                                .graphicsLayer {
+                                    alpha = artworkAlpha
+                                }
+                                .zIndex(2f)
+                        ) {
+                            AsyncImage(
+                                model = artwork,
+                                contentDescription = transition.item.title,
+                                modifier = Modifier.fillMaxSize(),
+                                contentScale = androidx.compose.ui.layout.ContentScale.Crop
+                            )
+                        }
+                    }
                 }
 
                 AnimatedVisibility(
@@ -2034,9 +3529,29 @@ internal fun LyricsToolScreen(
                                 .calculateBottomPadding() + 12.dp
                         )
                 ) {
-                    FloatingNavigationBar(
-                        selectedPage = selectedPage,
-                        onSelect = { selectedPage = it }
+                    AnimatedFloatingNavigationBar(
+                        selectedPage = if (selectedSong != null) lyricsReturnPage else selectedPage,
+                        collectionTheme = selectedPage == ToolPage.Collection ||
+                            selectedPage == ToolPage.Artist ||
+                            selectedPage == ToolPage.ArtistTopSongs,
+                        collapseProgress = navigationCollapseProgress,
+                        darkTheme = appDarkTheme,
+                        expandedWidth = originalPlayerCapsuleWidth,
+                        onSelect = { page ->
+                            selectedPage = page
+                            if (page == ToolPage.Home) {
+                                scope.launch {
+                                    homeRecyclerState.scrollToPosition(0)
+                                }
+                            }
+                            if (page != ToolPage.Settings) {
+                                selectedSong = null
+                                lyricsCollapsed = false
+                                fullscreenLyrics = false
+                                fetchedLyrics = null
+                                lyricsError = null
+                            }
+                        }
                     )
                 }
             }
@@ -2046,11 +3561,1298 @@ internal fun LyricsToolScreen(
 }
 
 @Composable
+@OptIn(ExperimentalFoundationApi::class)
+private fun CatalogCollectionPage(
+    collection: HomeCollection?,
+    listState: LazyListState,
+    isLoading: Boolean,
+    error: String?,
+    onBack: () -> Unit,
+    onSearch: () -> Unit,
+    onPlayTrack: (Int) -> Unit,
+    onShuffle: () -> Unit,
+    onDownload: () -> Unit,
+    onOpenAlbum: (AppleLibrarySync.SongRow) -> Unit,
+    onOpenArtist: (AppleLibrarySync.SongRow) -> Unit,
+    playingSong: SongHit?,
+    isPlaybackPlaying: Boolean
+) {
+    val context = LocalContext.current
+    val localView = LocalView.current
+    val imageLoader = remember(context) { ImageLoader(context) }
+    val metadata = collection?.metadata
+    val artworkAspectRatio = (metadata?.artworkAspectRatio
+        ?: collection?.item?.artworkAspectRatio
+        ?: 0.75f).coerceIn(0.5f, 2f)
+    val artworkWidthPx = context.resources.displayMetrics.widthPixels.coerceAtLeast(1)
+        .coerceAtMost(2048)
+    val artworkHeightPx = (artworkWidthPx / artworkAspectRatio).toInt().coerceAtLeast(1)
+    val statusBarInsetPx = remember(context) {
+        val rootInsets = localView.rootWindowInsets
+        val systemTop = if (
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && rootInsets != null
+        ) {
+            rootInsets.getInsetsIgnoringVisibility(
+                android.view.WindowInsets.Type.statusBars()
+            ).top
+        } else {
+            rootInsets?.systemWindowInsetTop ?: 0
+        }
+        val cutoutTop = rootInsets?.displayCutout?.safeInsetTop ?: 0
+        maxOf(systemTop, cutoutTop).takeIf { it > 0 } ?: context.resources.getIdentifier(
+            "status_bar_height",
+            "dimen",
+            "android"
+        ).let { resourceId ->
+            if (resourceId != 0) context.resources.getDimensionPixelSize(resourceId) else 0
+        }
+    }
+    val collectionControlsTopInset =
+        with(LocalDensity.current) { statusBarInsetPx.toDp() } + 8.dp
+    val artworkTemplate = metadata?.artworkUrl.orEmpty()
+        .ifBlank { collection?.item?.ambientPreviewUrl.orEmpty() }
+        .ifBlank { collection?.item?.artwork.orEmpty() }
+    val artworkUrl = resolveResponsiveArtwork(
+        artworkTemplate,
+        artworkWidthPx,
+        artworkHeightPx
+    )
+    val ambientVideoUrl = metadata?.ambientVideoUrl.orEmpty()
+        .ifBlank { collection?.item?.ambientVideoUrl.orEmpty() }
+    var pageBackground by remember(artworkUrl) { mutableStateOf(Color(0xFF18181A)) }
+    var accentColor by remember(artworkUrl) { mutableStateOf(Color(0xFFD1D1D6)) }
+    var sortedByTitle by remember(artworkUrl) { mutableStateOf(false) }
+    var showSortMenu by remember { mutableStateOf(false) }
+    val animatedPageBackground by animateColorAsState(
+        targetValue = pageBackground,
+        animationSpec = tween(500),
+        label = "collectionArtworkColor"
+    )
+    val animatedAccentColor by animateColorAsState(
+        targetValue = accentColor,
+        animationSpec = tween(500),
+        label = "collectionAccentColor"
+    )
+
+    LaunchedEffect(artworkUrl) {
+        if (artworkUrl.isBlank()) return@LaunchedEffect
+        val request = ImageRequest.Builder(context)
+            .data(artworkUrl)
+            .size(artworkWidthPx, artworkHeightPx)
+            .allowHardware(false)
+            .build()
+        try {
+            val result = imageLoader.execute(request)
+            if (result is SuccessResult) {
+                val bitmap = result.drawable.toBitmap()
+                val palette = withContext(Dispatchers.Default) {
+                    Palette.from(bitmap).generate()
+                }
+                val baseSwatch = palette.darkMutedSwatch
+                    ?: palette.darkVibrantSwatch
+                    ?: palette.mutedSwatch
+                    ?: palette.dominantSwatch
+                val accentSwatch = palette.vibrantSwatch
+                    ?: palette.lightVibrantSwatch
+                    ?: palette.darkVibrantSwatch
+                    ?: palette.dominantSwatch
+                baseSwatch?.let { swatch ->
+                    val extracted = Color(swatch.rgb)
+                    val darkening = if (extracted.luminance() > 0.3f) 0.58f else 0.26f
+                    pageBackground = lerp(extracted, Color.Black, darkening)
+                }
+                accentSwatch?.let { swatch ->
+                    val extracted = Color(swatch.rgb)
+                    accentColor = if (extracted.luminance() < 0.28f) {
+                        lerp(extracted, Color.White, 0.55f)
+                    } else {
+                        extracted
+                    }
+                }
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            Log.w("CatalogCollectionPage", "封面取色失败：${error.message}")
+        }
+    }
+
+    val trackCardColor = lerp(animatedPageBackground, Color.White, 0.08f)
+    val secondaryTextColor = Color.White.copy(alpha = 0.82f)
+    when {
+        isLoading -> Box(
+            Modifier.fillMaxSize().background(animatedPageBackground),
+            contentAlignment = Alignment.Center
+        ) {
+            if (artworkUrl.isNotBlank()) {
+                AsyncImage(
+                    model = artworkUrl,
+                    contentDescription = null,
+                    modifier = Modifier.fillMaxSize().blur(32.dp),
+                    contentScale = androidx.compose.ui.layout.ContentScale.Crop
+                )
+            }
+            Box(
+                Modifier.fillMaxSize().background(
+                    Brush.verticalGradient(
+                        0f to animatedPageBackground.copy(alpha = 0.52f),
+                        0.5f to animatedPageBackground.copy(alpha = 0.82f),
+                        1f to animatedPageBackground.copy(alpha = 0.96f)
+                    )
+                )
+            )
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                if (artworkUrl.isNotBlank()) {
+                    AsyncImage(
+                        model = artworkUrl,
+                        contentDescription = collection?.item?.title,
+                        modifier = Modifier
+                            .size(208.dp)
+                            .clip(RoundedCornerShape(18.dp)),
+                        contentScale = androidx.compose.ui.layout.ContentScale.Crop
+                    )
+                }
+                CircularProgressIndicator(
+                    modifier = Modifier.padding(top = 26.dp),
+                    color = animatedAccentColor
+                )
+            }
+        }
+        error != null -> Column(
+            modifier = Modifier.fillMaxSize()
+                .background(animatedPageBackground)
+                .padding(horizontal = 24.dp, vertical = 20.dp)
+        ) {
+            TextButton(onClick = onBack) { Text("‹ 主页", color = animatedAccentColor) }
+            Text("无法加载曲目", color = Color.White, style = MaterialTheme.typography.titleLarge)
+            Text(error, color = Color(0xFFB7B7BC), modifier = Modifier.padding(top = 8.dp))
+        }
+        collection != null -> {
+            val description = metadata?.description.orEmpty()
+                .ifBlank { collection.item.collectionDescription }
+            val displayedTracks = remember(collection.tracks, sortedByTitle) {
+                if (sortedByTitle) collection.tracks.sortedBy { it.title.lowercase() }
+                else collection.tracks
+            }
+            Box(modifier = Modifier.fillMaxSize().background(animatedPageBackground)) {
+                AsyncImage(
+                    model = artworkUrl,
+                    contentDescription = null,
+                    modifier = Modifier.fillMaxSize().blur(32.dp),
+                    contentScale = androidx.compose.ui.layout.ContentScale.Crop
+                )
+                Box(
+                    Modifier.fillMaxSize().background(
+                        Brush.verticalGradient(
+                            0f to animatedPageBackground.copy(alpha = 0.6f),
+                            0.35f to animatedPageBackground.copy(alpha = 0.87f),
+                            1f to animatedPageBackground.copy(alpha = 0.96f)
+                        )
+                    )
+                )
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    state = listState,
+                    contentPadding = PaddingValues(bottom = 160.dp)
+                ) {
+                    item(key = "collection-hero") {
+                    BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+                        val artworkHeight = (maxWidth / artworkAspectRatio)
+                            .coerceIn(220.dp, 680.dp)
+                        val heroHeight = artworkHeight + 106.dp
+                        Box(modifier = Modifier.fillMaxWidth().height(heroHeight)) {
+                            val blurTailHeight = 176.dp
+                            val blurOverlap = 88.dp
+                            Box(
+                                modifier = Modifier.fillMaxWidth()
+                                    .height(blurTailHeight)
+                                    .offset(y = artworkHeight - blurOverlap)
+                            ) {
+                                AsyncImage(
+                                    model = artworkUrl,
+                                    contentDescription = null,
+                                    modifier = Modifier.fillMaxSize().blur(36.dp),
+                                    contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                                    alignment = Alignment.BottomCenter
+                                )
+                                Box(
+                                    modifier = Modifier.fillMaxSize().background(
+                                        Brush.verticalGradient(
+                                            0f to Color.Transparent,
+                                            0.38f to animatedPageBackground.copy(alpha = 0.14f),
+                                            0.76f to animatedPageBackground.copy(alpha = 0.72f),
+                                            1f to animatedPageBackground
+                                        )
+                                    )
+                                )
+                            }
+                            AmbientCollectionArtwork(
+                                artworkUrl = artworkUrl,
+                                videoUrl = ambientVideoUrl,
+                                modifier = Modifier.fillMaxWidth().height(artworkHeight)
+                            )
+                            Box(
+                                Modifier.fillMaxWidth().height(heroHeight).background(
+                                    Brush.verticalGradient(
+                                        0f to Color.Black.copy(alpha = 0.18f),
+                                        0.54f to animatedPageBackground.copy(alpha = 0.04f),
+                                        0.83f to animatedPageBackground.copy(alpha = 0.7f),
+                                        1f to animatedPageBackground
+                                    )
+                                )
+                            )
+                            Column(
+                                modifier = Modifier.align(Alignment.BottomCenter)
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 20.dp, vertical = 18.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                Text(
+                                    metadata?.title?.ifBlank { collection.item.title }
+                                        ?: collection.item.title,
+                                    color = Color.White,
+                                    style = MaterialTheme.typography.titleLarge,
+                                    fontWeight = FontWeight.Bold,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                                )
+                                val creator = metadata?.creator.orEmpty()
+                                    .ifBlank { collection.item.creator }
+                                    .ifBlank {
+                                        collection.item.subtitle
+                                    }
+                                if (creator.isNotBlank()) {
+                                    Text(
+                                        creator,
+                                        color = Color(0xFFE3F4ED),
+                                        style = MaterialTheme.typography.titleMedium,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                                        modifier = Modifier.padding(top = 3.dp).then(
+                                            if (collection.item.isAlbum) {
+                                                Modifier.clickable {
+                                                    onOpenArtist(
+                                                        AppleLibrarySync.SongRow().apply {
+                                                            artist = creator
+                                                            artistId = metadata?.creatorId.orEmpty()
+                                                        }
+                                                    )
+                                                }
+                                            } else {
+                                                Modifier
+                                            }
+                                        )
+                                    )
+                                }
+                                val count = metadata?.trackCount?.takeIf { it > 0 }
+                                    ?: collection.item.trackCount.takeIf { it > 0 }
+                                    ?: collection.tracks.size
+                                val date = metadata?.updatedAt.orEmpty()
+                                    .ifBlank { collection.item.updatedAt }
+                                    .takeIf(String::isNotBlank)
+                                    ?.let(::formatCollectionDate)
+                                val dateLabel = date?.let {
+                                    if (collection.item.isAlbum) "发行于 $it" else "更新于 $it"
+                                }
+                                Text(
+                                    listOfNotNull("$count 首歌曲", dateLabel).joinToString(" · "),
+                                    color = secondaryTextColor,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                                    modifier = Modifier.padding(top = 4.dp)
+                                )
+                            }
+                        }
+                    }
+                        }
+                        stickyHeader(key = "collection-actions") {
+                        Row(
+                            modifier = Modifier.fillMaxWidth()
+                                .background(animatedPageBackground.copy(alpha = 0.96f))
+                                .padding(horizontal = 20.dp, vertical = 10.dp),
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            IconButton(
+                                onClick = onShuffle,
+                                enabled = collection.tracks.isNotEmpty(),
+                                modifier = Modifier.size(64.dp)
+                                    .clip(RoundedCornerShape(16.dp))
+                                    .background(trackCardColor)
+                            ) {
+                                Icon(
+                                    Icons.Filled.Shuffle,
+                                    contentDescription = "随机播放",
+                                    tint = Color.White
+                                )
+                            }
+                            Button(
+                                onClick = { onPlayTrack(0) },
+                                modifier = Modifier.weight(1f).height(56.dp),
+                                enabled = collection.tracks.isNotEmpty(),
+                                shape = RoundedCornerShape(10.dp),
+                                colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+                                    containerColor = Color.White,
+                                    contentColor = animatedPageBackground
+                                )
+                            ) {
+                                Icon(Icons.Filled.PlayArrow, contentDescription = null)
+                                Text(
+                                    "播放",
+                                    modifier = Modifier.padding(start = 4.dp),
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
+                            IconButton(
+                                onClick = onDownload,
+                                enabled = collection.tracks.isNotEmpty(),
+                                modifier = Modifier.size(64.dp)
+                                    .clip(RoundedCornerShape(16.dp))
+                                    .background(trackCardColor)
+                            ) {
+                                Icon(
+                                    Icons.Filled.CloudDownload,
+                                    contentDescription = "下载",
+                                    tint = Color.White
+                                )
+                            }
+                        }
+                    }
+                    if (description.isNotBlank()) {
+                        item(key = "collection-description") {
+                            Text(
+                                description,
+                                modifier = Modifier.fillMaxWidth()
+                                    .padding(horizontal = 24.dp, vertical = 8.dp),
+                                color = secondaryTextColor,
+                                style = MaterialTheme.typography.bodySmall,
+                                maxLines = 3,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                    collection.metadataError?.let { detailsError ->
+                        item(key = "collection-metadata-warning") {
+                            Text(
+                                "部分详情暂不可用：$detailsError",
+                                modifier = Modifier.fillMaxWidth()
+                                    .padding(horizontal = 24.dp, vertical = 4.dp),
+                                color = Color(0xFFFFD18A),
+                                style = MaterialTheme.typography.labelSmall,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                    itemsIndexed(displayedTracks, key = { _, row -> row.uri }) { index, row ->
+                        HomeCollectionTrackRow(
+                            track = row,
+                            index = index,
+                            cardColor = trackCardColor,
+                            secondaryTextColor = secondaryTextColor,
+                            isPlaying = isPlaybackPlaying &&
+                                playingSong?.let {
+                                    it.title == row.title && it.artist == row.artist
+                                } == true,
+                            onOpenAlbum = { onOpenAlbum(row) },
+                            onOpenArtist = { onOpenArtist(row) },
+                            onClick = {
+                                val actualIndex = collection.tracks.indexOf(row)
+                                onPlayTrack(actualIndex.coerceAtLeast(0))
+                            }
+                        )
+                    }
+                }
+                Row(
+                    modifier = Modifier.align(Alignment.TopStart)
+                        .fillMaxWidth()
+                        .padding(
+                            start = 16.dp,
+                            top = collectionControlsTopInset,
+                            end = 16.dp,
+                            bottom = 12.dp
+                        ),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Surface(
+                        shape = CircleShape,
+                        color = animatedPageBackground.copy(alpha = 0.76f)
+                    ) {
+                        IconButton(onClick = onBack) {
+                            Text("‹", color = Color.White, fontSize = 30.sp, lineHeight = 30.sp)
+                        }
+                    }
+                    Surface(
+                        shape = RoundedCornerShape(30.dp),
+                        color = animatedPageBackground.copy(alpha = 0.76f)
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            IconButton(onClick = onSearch) {
+                                Icon(Icons.Filled.Search, contentDescription = "搜索", tint = Color.White)
+                            }
+                            Box {
+                                IconButton(onClick = { sortedByTitle = !sortedByTitle }) {
+                                    Icon(Icons.Filled.Sort, contentDescription = "排序", tint = Color.White)
+                                }
+                                DropdownMenu(
+                                    expanded = showSortMenu,
+                                    onDismissRequest = { showSortMenu = false }
+                                ) {
+                                    DropdownMenuItem(
+                                        text = {
+                                            Text(if (sortedByTitle) "按曲目顺序" else "按标题排序")
+                                        },
+                                        onClick = {
+                                            sortedByTitle = !sortedByTitle
+                                            showSortMenu = false
+                                        }
+                                    )
+                                }
+                            }
+                            IconButton(onClick = { showSortMenu = !showSortMenu }) {
+                                Icon(Icons.Filled.MoreHoriz, contentDescription = "更多", tint = Color.White)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AmbientCollectionArtwork(
+    artworkUrl: String,
+    videoUrl: String,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    Box(modifier = modifier.clipToBounds()) {
+        AsyncImage(
+            model = artworkUrl,
+            contentDescription = null,
+            modifier = Modifier.fillMaxSize(),
+            contentScale = androidx.compose.ui.layout.ContentScale.Fit
+        )
+        if (videoUrl.startsWith("https://", ignoreCase = true)) {
+            val player = remember(context, videoUrl) {
+                ExoPlayer.Builder(context.applicationContext).build().apply {
+                    volume = 0f
+                    repeatMode = Player.REPEAT_MODE_ONE
+                    videoScalingMode = C.VIDEO_SCALING_MODE_SCALE_TO_FIT
+                }
+            }
+            var textureView by remember(player) { mutableStateOf<TextureView?>(null) }
+            var renderedFirstFrame by remember(videoUrl) { mutableStateOf(false) }
+            DisposableEffect(player, videoUrl) {
+                val listener = object : Player.Listener {
+                    override fun onRenderedFirstFrame() {
+                        renderedFirstFrame = true
+                    }
+
+                    override fun onPlayerError(error: PlaybackException) {
+                        renderedFirstFrame = false
+                        Log.w(
+                            "CatalogCollectionPage",
+                            "动态封面播放失败，改用静态预览图",
+                            error
+                        )
+                    }
+                }
+                player.addListener(listener)
+                player.setMediaItem(MediaItem.fromUri(videoUrl))
+                player.prepare()
+                player.playWhenReady = true
+                onDispose {
+                    player.removeListener(listener)
+                    textureView?.let(player::clearVideoTextureView)
+                    player.release()
+                    textureView = null
+                }
+            }
+            AndroidView(
+                factory = { viewContext ->
+                    TextureView(viewContext).also { view ->
+                        textureView = view
+                        player.setVideoTextureView(view)
+                    }
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+            if (!renderedFirstFrame) {
+                AsyncImage(
+                    model = artworkUrl,
+                    contentDescription = null,
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = androidx.compose.ui.layout.ContentScale.Fit
+                )
+            }
+        }
+    }
+}
+
+private fun resolveResponsiveArtwork(
+    template: String,
+    width: Int,
+    height: Int
+): String = template
+    .replace("{w}", width.toString())
+    .replace("{h}", height.toString())
+    .replace("{f}", "jpg")
+
+private fun formatCollectionDate(rawDate: String): String {
+    val datePart = rawDate.take(10)
+    return try {
+        val date = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
+            .parse(datePart)
+            ?: return datePart
+        java.text.SimpleDateFormat("MMM d, yyyy", java.util.Locale.US).format(date)
+    } catch (_: java.text.ParseException) {
+        datePart
+    }
+}
+
+@Composable
+private fun HomeCollectionTrackRow(
+    track: AppleLibrarySync.SongRow,
+    index: Int,
+    cardColor: Color,
+    secondaryTextColor: Color,
+    isPlaying: Boolean,
+    onOpenAlbum: () -> Unit,
+    onOpenArtist: () -> Unit,
+    onClick: () -> Unit
+) {
+    var showTrackMenu by remember(track.uri) { mutableStateOf(false) }
+    Row(
+        modifier = Modifier.fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 4.dp)
+            .clip(RoundedCornerShape(14.dp))
+            .background(cardColor)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        if (isPlaying) {
+            Icon(
+                Icons.Filled.GraphicEq,
+                contentDescription = "正在播放",
+                tint = Color(0xFFA4E6C8),
+                modifier = Modifier.width(44.dp).height(44.dp).padding(10.dp)
+            )
+        } else {
+            AsyncImage(
+                model = track.coverUrl.ifBlank { null },
+                contentDescription = null,
+                modifier = Modifier.size(44.dp).clip(RoundedCornerShape(6.dp)),
+                contentScale = androidx.compose.ui.layout.ContentScale.Crop
+            )
+        }
+        Column(Modifier.weight(1f).padding(start = 12.dp, end = 8.dp)) {
+            Text(
+                track.title,
+                color = Color.White,
+                style = MaterialTheme.typography.bodyLarge,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.clickable(onClick = onOpenAlbum)
+            )
+            Text(
+                track.artist,
+                color = secondaryTextColor,
+                style = MaterialTheme.typography.bodyMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.clickable(onClick = onOpenArtist)
+            )
+        }
+        val durationSeconds = track.durationMs / 1000L
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                if (durationSeconds > 0) {
+                    "%d:%02d".format(durationSeconds / 60, durationSeconds % 60)
+                } else {
+                    (index + 1).toString()
+                },
+                color = secondaryTextColor,
+                style = MaterialTheme.typography.labelMedium
+            )
+            Box {
+                IconButton(
+                    onClick = { showTrackMenu = true },
+                    modifier = Modifier.size(34.dp)
+                ) {
+                    Icon(
+                        Icons.Filled.MoreHoriz,
+                        contentDescription = "更多：${track.title}",
+                        tint = secondaryTextColor
+                    )
+                }
+                DropdownMenu(
+                    expanded = showTrackMenu,
+                    onDismissRequest = { showTrackMenu = false }
+                ) {
+                    DropdownMenuItem(
+                        text = { Text("播放") },
+                        onClick = {
+                            showTrackMenu = false
+                            onClick()
+                        }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MusicHomePage(
+    shelves: List<Shelf>,
+    profileAvatarUri: Uri?,
+    darkTheme: Boolean,
+    statusBarHeight: Dp,
+    isSignedIn: Boolean,
+    isLoading: Boolean,
+    error: String?,
+    onSettings: () -> Unit,
+    onRefresh: () -> Unit,
+    recyclerState: ComposeRecyclerListState,
+    sectionStateHolder: androidx.compose.runtime.saveable.SaveableStateHolder,
+    onScrollChanged: (Boolean, Boolean) -> Unit,
+    onOpenItem: (ShelfItem, Rect) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val returnToTop: () -> Unit = {
+        recyclerState.scrollToPosition(0)
+    }
+    val featuredShelf = shelves.firstOrNull()
+    val featuredItems = featuredShelf?.items.orEmpty()
+    val remainingShelves = remember(shelves) { shelves.drop(1) }
+    val appleRed = Color(0xFFFF375F)
+    val background = if (darkTheme) Color(0xFF1C1C1E)
+    else MaterialTheme.colorScheme.background
+    val primaryTextColor = if (darkTheme) Color.White else MaterialTheme.colorScheme.onBackground
+    val secondaryTextColor = if (darkTheme) Color(0xFFAAAAAF)
+    else MaterialTheme.colorScheme.onSurfaceVariant
+    val cardColor = if (darkTheme) Color(0xFF303034)
+    else MaterialTheme.colorScheme.surfaceVariant
+    val density = LocalDensity.current
+    val scrollCollapseDistancePx = with(density) { 56.dp.toPx() }
+    val headerCollapseProgress = remember(recyclerState, scrollCollapseDistancePx) {
+        derivedStateOf {
+            if (recyclerState.firstVisibleItemPosition > 0) {
+                1f
+            } else {
+                (recyclerState.scrollOffsetPx / scrollCollapseDistancePx)
+                    .coerceIn(0f, 1f)
+            }
+        }
+    }
+    var previousScrollY by remember(recyclerState) { mutableIntStateOf(-1) }
+    var candidateDirection by remember(recyclerState) { mutableStateOf<Boolean?>(null) }
+    var accumulatedDistance by remember(recyclerState) { mutableIntStateOf(0) }
+    val directionThresholdPx = with(density) { 10.dp.toPx() }
+    val onRecyclerScroll: (RecyclerView, Int, Int) -> Unit = { recyclerView, _, dy ->
+        val currentScrollY = recyclerView.computeVerticalScrollOffset()
+        if (previousScrollY < 0) {
+            onScrollChanged(currentScrollY > 24, true)
+            previousScrollY = currentScrollY
+        } else if (dy != 0) {
+            val scrollingDown = dy > 0
+            if (candidateDirection != scrollingDown) {
+                candidateDirection = scrollingDown
+                accumulatedDistance = 0
+            }
+            accumulatedDistance += kotlin.math.abs(dy)
+            if (currentScrollY == 0) {
+                onScrollChanged(false, false)
+                accumulatedDistance = 0
+            } else if (accumulatedDistance >= directionThresholdPx) {
+                onScrollChanged(scrollingDown, false)
+                accumulatedDistance = 0
+            }
+            previousScrollY = currentScrollY
+        }
+    }
+    var focusedShelfKey by remember(recyclerState) { mutableStateOf<String?>(null) }
+    LaunchedEffect(recyclerState) {
+        snapshotFlow { recyclerState.isScrollInProgress }.collectLatest { scrolling ->
+            if (scrolling) {
+                focusedShelfKey = null
+            } else {
+                delay(220)
+                focusedShelfKey = recyclerState.focusedItemKey
+            }
+        }
+    }
+    val latestOnOpenItem = rememberUpdatedState(onOpenItem)
+    val latestOnSettings = rememberUpdatedState(onSettings)
+    val latestIsLoading = rememberUpdatedState(isLoading)
+    val sections = buildList {
+        if (!isSignedIn) {
+            add(
+                ComposeRecyclerSection(
+                    key = "home:connect",
+                    viewType = 1,
+                    revision = cardColor
+                ) {
+                    Card(
+                        onClick = { latestOnSettings.value() },
+                        modifier = Modifier.fillMaxWidth()
+                            .padding(horizontal = 20.dp, vertical = 10.dp),
+                        shape = RoundedCornerShape(20.dp),
+                        colors = CardDefaults.cardColors(containerColor = cardColor)
+                    ) {
+                        Column(Modifier.padding(18.dp)) {
+                            Text(
+                                "连接 Apple Music",
+                                color = primaryTextColor,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                "登录后查看为你精选的歌单、专辑和个性电台。",
+                                color = secondaryTextColor,
+                                modifier = Modifier.padding(top = 5.dp)
+                            )
+                        }
+                    }
+                }
+            )
+        } else if (error != null) {
+            add(
+                ComposeRecyclerSection(
+                    key = "home:error",
+                    viewType = 2,
+                    revision = error
+                ) {
+                    Column(
+                        modifier = Modifier.fillMaxWidth()
+                            .padding(horizontal = 20.dp, vertical = 12.dp)
+                    ) {
+                        Text(error, color = secondaryTextColor)
+                    }
+                }
+            )
+        }
+
+        val featuredShelfFocused = focusedShelfKey == "home:featured"
+        add(
+            ComposeRecyclerSection(
+                key = "home:featured",
+                viewType = 3,
+                revision = listOf(featuredShelf, isLoading, featuredShelfFocused, darkTheme)
+            ) {
+                Column {
+                    Text(
+                        featuredShelf?.title ?: "为你精选",
+                        modifier = Modifier.padding(
+                            start = 20.dp,
+                            end = 20.dp,
+                            top = 18.dp,
+                            bottom = 12.dp
+                        ),
+                        color = primaryTextColor,
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold
+                    )
+                    if (featuredItems.isEmpty()) {
+                        Text(
+                            if (latestIsLoading.value) {
+                                "正在准备你的推荐…"
+                            } else {
+                                "登录 Apple Music 后，这里会出现专属推荐。"
+                            },
+                            modifier = Modifier.padding(horizontal = 20.dp, vertical = 14.dp),
+                            color = secondaryTextColor
+                        )
+                    } else {
+                        val featuredRowState = rememberLazyListState()
+                        val featuredFocusIndex = rememberSettledFocusIndex(
+                            rowState = featuredRowState,
+                            isShelfFocused = featuredShelfFocused
+                        )
+                        LazyRow(
+                            state = featuredRowState,
+                            contentPadding = PaddingValues(horizontal = 20.dp),
+                            horizontalArrangement = Arrangement.spacedBy(14.dp)
+                        ) {
+                            itemsIndexed(
+                                featuredItems,
+                                key = { _, item -> "featured:${item.id}" }
+                            ) { index, item ->
+                                HomeFeatureCard(
+                                    item = item,
+                                    isFocused = index == featuredFocusIndex,
+                                    onClick = { bounds ->
+                                        latestOnOpenItem.value(item, bounds)
+                                    }
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        )
+
+        remainingShelves.forEach { shelf ->
+            val shelfFocused = focusedShelfKey == "home:${shelf.id}"
+            add(
+                ComposeRecyclerSection(
+                    key = "home:${shelf.id}",
+                    viewType = 4,
+                    revision = listOf(shelf, darkTheme, shelfFocused)
+                ) {
+                    HomeShelfSection(
+                        shelf = shelf,
+                        darkTheme = darkTheme,
+                        isShelfFocused = shelfFocused,
+                        onOpenItem = { item, bounds ->
+                            latestOnOpenItem.value(item, bounds)
+                        }
+                    )
+                }
+            )
+        }
+    }
+    val headerSurfaceBaseColor =
+        if (darkTheme) Color(0xE52C2C2E) else Color(0xEFFFFFFF)
+    val headerSurfaceModifier = Modifier.drawBehind {
+        val progress = headerCollapseProgress.value
+        drawRoundRect(
+            color = headerSurfaceBaseColor.copy(alpha = headerSurfaceBaseColor.alpha * progress),
+            cornerRadius = androidx.compose.ui.geometry.CornerRadius(size.height / 2f)
+        )
+    }
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .background(background)
+    ) {
+        ComposeRecyclerSections(
+            sections = sections,
+            state = recyclerState,
+            saveableStateHolder = sectionStateHolder,
+            contentPadding = PaddingValues(top = 90.dp, bottom = 160.dp),
+            onScroll = onRecyclerScroll,
+            onPullToRefresh = { if (!isLoading) onRefresh() },
+            pullToRefreshThresholdPx = with(density) { 64.dp.toPx() },
+            modifier = Modifier.fillMaxSize()
+        )
+        Row(
+            modifier = Modifier.align(Alignment.TopStart)
+                .offset(y = statusBarHeight)
+                .fillMaxWidth()
+                .height(58.dp)
+                .padding(horizontal = 16.dp, vertical = 4.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Surface(
+                modifier = headerSurfaceModifier.clickable(onClick = returnToTop),
+                shape = RoundedCornerShape(24.dp),
+                color = Color.Transparent
+            ) {
+                Text(
+                    "主页",
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                    color = primaryTextColor,
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+            Surface(
+                modifier = headerSurfaceModifier,
+                shape = RoundedCornerShape(28.dp),
+                color = Color.Transparent
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = onSettings) {
+                        if (profileAvatarUri == null) {
+                            Icon(
+                                Icons.Filled.Person,
+                                contentDescription = "账户与设置",
+                                tint = appleRed
+                            )
+                        } else {
+                            AsyncImage(
+                                model = profileAvatarUri,
+                                contentDescription = "账户与设置",
+                                modifier = Modifier.size(26.dp).clip(CircleShape),
+                                contentScale = ContentScale.Crop
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun HomeFeatureCard(
+    item: ShelfItem,
+    isFocused: Boolean,
+    onClick: (Rect) -> Unit
+) {
+    val cardCoordinates = remember { arrayOfNulls<LayoutCoordinates>(1) }
+    Card(
+        onClick = { onClick(cardCoordinates[0]?.boundsInWindow() ?: Rect.Zero) },
+        modifier = Modifier.width(240.dp).aspectRatio(0.75f)
+            .onGloballyPositioned { cardCoordinates[0] = it },
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF39393D))
+    ) {
+        Box(Modifier.fillMaxSize()) {
+            HomeMotionArtwork(
+                item = item,
+                artworkUrl = item.ambientPreviewUrl
+                    .ifBlank { item.heroArtwork.ifBlank { item.artwork } },
+                isFocused = isFocused,
+                preferSquareArtwork = false,
+                contentScale = androidx.compose.ui.layout.ContentScale.Crop
+            )
+            Box(
+                Modifier.fillMaxSize()
+                    .background(
+                    Brush.verticalGradient(
+                        colors = listOf(Color.Transparent, Color(0xCC111114)),
+                        startY = 110f
+                    )
+                )
+            )
+            Column(
+                modifier = Modifier.align(Alignment.BottomStart).padding(16.dp)
+            ) {
+                Text(
+                    item.reason.ifBlank { item.badge.ifBlank { "为你推荐" } },
+                    color = Color(0xFFE5E5E7),
+                    style = MaterialTheme.typography.labelLarge
+                )
+                Text(
+                    item.title,
+                    color = Color.White,
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(top = 3.dp)
+                )
+                if (item.subtitle.isNotBlank()) {
+                    Text(
+                        item.subtitle,
+                        color = Color(0xFFD1D1D6),
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun HomeShelfSection(
+    shelf: Shelf,
+    darkTheme: Boolean,
+    isShelfFocused: Boolean,
+    onOpenItem: (ShelfItem, Rect) -> Unit
+) {
+    if (shelf.items.isEmpty()) return
+    val primaryTextColor = if (darkTheme) Color.White else MaterialTheme.colorScheme.onBackground
+    val secondaryTextColor = if (darkTheme) Color(0xFFAAAAAF)
+    else MaterialTheme.colorScheme.onSurfaceVariant
+    val rowState = rememberLazyListState()
+    val focusedIndex = rememberSettledFocusIndex(rowState, isShelfFocused)
+    Column(Modifier.fillMaxWidth().padding(top = 26.dp, bottom = 4.dp)) {
+        Text(
+            shelf.title,
+            modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
+            color = primaryTextColor,
+            style = MaterialTheme.typography.titleLarge,
+            fontWeight = FontWeight.Bold
+        )
+        LazyRow(
+            state = rowState,
+            contentPadding = PaddingValues(horizontal = 20.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            itemsIndexed(shelf.items, key = { _, item -> item.id }) { index, item ->
+                val itemCoordinates = remember(item.id) {
+                    arrayOfNulls<LayoutCoordinates>(1)
+                }
+                Column(
+                    modifier = Modifier.width(156.dp)
+                        .onGloballyPositioned { itemCoordinates[0] = it }
+                        .clickable {
+                            onOpenItem(item, itemCoordinates[0]?.boundsInWindow() ?: Rect.Zero)
+                        }
+                ) {
+                    if (item.artwork.isNotBlank() || item.ambientPreviewUrl.isNotBlank()) {
+                        HomeMotionArtwork(
+                            item = item,
+                            artworkUrl = item.ambientSquarePreviewUrl
+                                .ifBlank { item.artwork },
+                            isFocused = isShelfFocused && index == focusedIndex,
+                            preferSquareArtwork = true,
+                            modifier = Modifier.fillMaxWidth().height(156.dp)
+                                .clip(RoundedCornerShape(10.dp)),
+                            contentScale = androidx.compose.ui.layout.ContentScale.Crop
+                        )
+                    } else {
+                        Box(
+                            modifier = Modifier.fillMaxWidth().height(156.dp)
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(
+                                    if (darkTheme) Color(0xFF39393D)
+                                    else MaterialTheme.colorScheme.surfaceVariant
+                                ),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                Icons.Filled.MusicNote,
+                                contentDescription = null,
+                                tint = Color(0xFFFF375F)
+                            )
+                        }
+                    }
+
+                    Text(
+                        item.title,
+                        modifier = Modifier.padding(top = 7.dp),
+                        color = primaryTextColor,
+                        style = MaterialTheme.typography.bodyMedium,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    if (item.subtitle.isNotBlank()) {
+                        Text(
+                            item.subtitle,
+                            color = secondaryTextColor,
+                            style = MaterialTheme.typography.bodySmall,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun LazyListState.focusedItemIndex(focusFraction: Float = 0.36f): Int {
+    val layout = layoutInfo
+    val viewportStart = layout.viewportStartOffset
+    val viewportEnd = layout.viewportEndOffset
+    val focusX = viewportStart + (viewportEnd - viewportStart) * focusFraction
+    return layout.visibleItemsInfo
+        .filter { item ->
+            val visibleStart = maxOf(item.offset, viewportStart)
+            val visibleEnd = minOf(item.offset + item.size, viewportEnd)
+            visibleEnd - visibleStart >= item.size / 2
+        }
+        .minByOrNull { item ->
+            kotlin.math.abs(item.offset + item.size / 2f - focusX)
+        }
+        ?.index ?: -1
+}
+
+@Composable
+private fun rememberSettledFocusIndex(
+    rowState: LazyListState,
+    isShelfFocused: Boolean
+): Int {
+    var focusedIndex by remember(rowState) { mutableStateOf(-1) }
+    LaunchedEffect(rowState, isShelfFocused) {
+        if (!isShelfFocused) {
+            focusedIndex = -1
+            return@LaunchedEffect
+        }
+        snapshotFlow { rowState.isScrollInProgress }.collectLatest { scrolling ->
+            if (scrolling) {
+                focusedIndex = -1
+            } else {
+                delay(180)
+                focusedIndex = rowState.focusedItemIndex()
+            }
+        }
+    }
+    return focusedIndex
+}
+
+private fun LazyListState.focusedItemKey(focusFraction: Float = 0.42f): Any? {
+    val layout = layoutInfo
+    val viewportStart = layout.viewportStartOffset
+    val viewportEnd = layout.viewportEndOffset
+    val focusY = viewportStart + (viewportEnd - viewportStart) * focusFraction
+    return layout.visibleItemsInfo
+        .filter { item ->
+            val visibleStart = maxOf(item.offset, viewportStart)
+            val visibleEnd = minOf(item.offset + item.size, viewportEnd)
+            visibleEnd - visibleStart >= item.size / 2
+        }
+        .minByOrNull { item ->
+            kotlin.math.abs(item.offset + item.size / 2f - focusY)
+        }
+        ?.key
+}
+
+private data class HomeMotionAssets(
+    val videoUrl: String,
+    val previewUrl: String
+)
+
+private val homeMotionAssetCache = ConcurrentHashMap<String, HomeMotionAssets>()
+
+@Composable
+private fun HomeMotionArtwork(
+    item: ShelfItem,
+    artworkUrl: String,
+    isFocused: Boolean,
+    preferSquareArtwork: Boolean,
+    modifier: Modifier = Modifier,
+    contentScale: androidx.compose.ui.layout.ContentScale
+) {
+    val context = LocalContext.current
+    val resourceType = if (item.isAlbum) "albums" else "playlists"
+    val resourceId = item.relatedCatalogId.ifBlank {
+        item.catalogId.ifBlank { item.id }
+    }
+    val cacheKey = "$resourceType:$resourceId:${if (preferSquareArtwork) "square" else "tall"}"
+    val initialVideoUrl = if (preferSquareArtwork) {
+        item.ambientSquareVideoUrl
+    } else {
+        item.ambientVideoUrl
+    }
+    val initialPreviewUrl = if (preferSquareArtwork) {
+        item.ambientSquarePreviewUrl.ifBlank { item.ambientPreviewUrl }
+    } else {
+        item.ambientPreviewUrl
+    }
+    var resolvedAssets by remember(cacheKey) {
+        mutableStateOf(
+            homeMotionAssetCache[cacheKey] ?: HomeMotionAssets(
+                initialVideoUrl,
+                initialPreviewUrl
+            )
+        )
+    }
+    var playbackEnabled by remember(cacheKey) { mutableStateOf(false) }
+    LaunchedEffect(item.id, isFocused) {
+        if (!isFocused || resolvedAssets.videoUrl.isNotBlank() ||
+            homeMotionAssetCache.containsKey(cacheKey) ||
+            !(item.isPlaylist || item.isAlbum)
+        ) {
+            return@LaunchedEffect
+        }
+        try {
+            val metadata = withContext(Dispatchers.IO) {
+                MusicRepository.api.getRecommendedCollectionMetadata(
+                    item,
+                    preferSquareArtwork = preferSquareArtwork
+                )
+            }
+            resolvedAssets = HomeMotionAssets(
+                videoUrl = if (preferSquareArtwork) {
+                    metadata.ambientSquareVideoUrl.ifBlank { metadata.ambientVideoUrl }
+                } else {
+                    metadata.ambientVideoUrl
+                },
+                previewUrl = if (preferSquareArtwork) {
+                    metadata.ambientSquarePreviewUrl
+                        .ifBlank { metadata.ambientPreviewUrl }
+                } else {
+                    metadata.ambientPreviewUrl
+                }
+            )
+            homeMotionAssetCache[cacheKey] = resolvedAssets
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            Log.w("MusicHomePage", "无法获取《${item.title}》的动态封面信息", error)
+            homeMotionAssetCache.putIfAbsent(
+                cacheKey,
+                HomeMotionAssets(initialVideoUrl, initialPreviewUrl)
+            )
+        }
+    }
+    LaunchedEffect(isFocused, resolvedAssets.videoUrl) {
+        playbackEnabled = false
+        if (isFocused && resolvedAssets.videoUrl.startsWith("https://", ignoreCase = true)) {
+            delay(300)
+            playbackEnabled = true
+        }
+    }
+
+    Box(modifier = modifier) {
+        val staticArtworkUrl = resolvedAssets.previewUrl.ifBlank { artworkUrl }
+        if (staticArtworkUrl.isNotBlank()) {
+            AsyncImage(
+                model = staticArtworkUrl,
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = contentScale
+            )
+        }
+        if (playbackEnabled) {
+            val player = remember(context, resolvedAssets.videoUrl) {
+                ExoPlayer.Builder(context.applicationContext).build().apply {
+                    volume = 0f
+                    repeatMode = Player.REPEAT_MODE_ONE
+                    videoScalingMode = C.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING
+                }
+            }
+            var textureView by remember(player) { mutableStateOf<TextureView?>(null) }
+            var renderedFirstFrame by remember(resolvedAssets.videoUrl) {
+                mutableStateOf(false)
+            }
+            DisposableEffect(player, resolvedAssets.videoUrl) {
+                val listener = object : Player.Listener {
+                    override fun onRenderedFirstFrame() {
+                        renderedFirstFrame = true
+                    }
+
+                    override fun onPlayerError(error: PlaybackException) {
+                        Log.w("MusicHomePage", "主页动态封面播放失败", error)
+                    }
+                }
+                player.addListener(listener)
+                player.setMediaItem(MediaItem.fromUri(resolvedAssets.videoUrl))
+                player.prepare()
+                player.playWhenReady = true
+                onDispose {
+                    player.removeListener(listener)
+                    textureView?.let(player::clearVideoTextureView)
+                    player.release()
+                    textureView = null
+                }
+            }
+            AndroidView(
+                factory = { viewContext ->
+                    TextureView(viewContext).also { view ->
+                        textureView = view
+                        player.setVideoTextureView(view)
+                    }
+                },
+                update = { view ->
+                    view.alpha = if (renderedFirstFrame) 1f else 0f
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+        }
+    }
+}
+
+@Composable
 private fun SongResults(
     songs: List<SongHit>,
     searching: Boolean,
     query: String,
     lyricMatches: Boolean,
+    onOpenAlbum: (SongHit) -> Unit,
+    onOpenArtist: (SongHit) -> Unit,
     onSongClick: (SongHit) -> Unit
 ) {
     if (searching && songs.isEmpty()) {
@@ -2118,13 +4920,23 @@ private fun SongResults(
             }
         }
         items(songs, key = { it.id }) { song ->
-            SongResultCard(song, onClick = { onSongClick(song) })
+            SongResultCard(
+                song = song,
+                onClick = { onSongClick(song) },
+                onOpenAlbum = { onOpenAlbum(song) },
+                onOpenArtist = { onOpenArtist(song) }
+            )
         }
     }
 }
 
 @Composable
-private fun SongResultCard(song: SongHit, onClick: () -> Unit) {
+private fun SongResultCard(
+    song: SongHit,
+    onClick: () -> Unit,
+    onOpenAlbum: () -> Unit,
+    onOpenArtist: () -> Unit
+) {
     ElevatedCard(
         onClick = onClick,
         modifier = Modifier.fillMaxWidth().animateContentSize(),
@@ -2157,7 +4969,8 @@ private fun SongResultCard(song: SongHit, onClick: () -> Unit) {
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.clickable(onClick = onOpenArtist)
                 )
                 if (song.album.isNotBlank()) {
                     Text(
@@ -2165,7 +4978,8 @@ private fun SongResultCard(song: SongHit, onClick: () -> Unit) {
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.clickable(onClick = onOpenAlbum)
                     )
                 }
             }
@@ -2212,6 +5026,8 @@ private fun LyricsDetail(
     onCollapseLyrics: () -> Unit,
     onLogin: () -> Unit,
     onOpenQueue: () -> Unit,
+    onOpenAlbum: () -> Unit,
+    onOpenArtist: () -> Unit,
     onQueueDragOffsetChange: (Float) -> Unit,
     coverQueueDragOffset: Float,
     onTogglePlayback: () -> Unit,
@@ -2537,6 +5353,8 @@ private fun LyricsDetail(
                 }
             },
             onOpenQueue = onOpenQueue,
+            onOpenAlbum = onOpenAlbum,
+            onOpenArtist = onOpenArtist,
             onNext = { PlaybackEngine.next() },
             onPrevious = { PlaybackEngine.prev() },
             onQueueDragOffsetChange = onQueueDragOffsetChange,
@@ -3453,6 +6271,8 @@ private fun KaraokePlaybackControls(
     showTranslations: Boolean,
     onToggleTranslations: () -> Unit,
     onOpenQueue: () -> Unit,
+    onOpenAlbum: () -> Unit,
+    onOpenArtist: () -> Unit,
     onNext: () -> Unit,
     onPrevious: () -> Unit,
     onQueueDragOffsetChange: (Float) -> Unit,
@@ -3641,7 +6461,7 @@ private fun KaraokePlaybackControls(
                     ) {
                         Text(
                             song.title,
-                            modifier = Modifier.weight(1f),
+                            modifier = Modifier.weight(1f).clickable(onClick = onOpenAlbum),
                             fontWeight = FontWeight.Bold,
                             fontSize = 17.sp,
                             maxLines = 1,
@@ -3652,7 +6472,8 @@ private fun KaraokePlaybackControls(
                         song.artist,
                         color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.9f),
                         maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.clickable(onClick = onOpenArtist)
                     )
                     if (fetchedLyrics != null) {
                         val wordTimed = fetchedLyrics.lyrics.wordTimedLines()
@@ -3833,6 +6654,7 @@ private fun EmptyLyrics(
 @Composable
 private fun SettingsPage(
     signedIn: Boolean,
+    profileAvatarUri: Uri?,
     cacheCount: Int,
     cacheBytes: Long,
     statusBarLyricsEnabled: Boolean,
@@ -3842,6 +6664,8 @@ private fun SettingsPage(
     manualThemeSeedHex: String,
     modifier: Modifier = Modifier,
     onLogin: () -> Unit,
+    onSelectProfileAvatar: () -> Unit,
+    onClearProfileAvatar: () -> Unit,
     onThemeModeChange: (AppThemeMode) -> Unit,
     onDynamicColorsChange: (Boolean) -> Unit,
     onManualThemeSeedChange: (String) -> Unit,
@@ -3891,6 +6715,59 @@ private fun SettingsPage(
             fontWeight = FontWeight.Bold,
             color = MaterialTheme.colorScheme.onSurface
         )
+        ElevatedCard(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(24.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Surface(
+                    modifier = Modifier.size(56.dp),
+                    shape = CircleShape,
+                    color = MaterialTheme.colorScheme.primaryContainer
+                ) {
+                    if (profileAvatarUri != null) {
+                        AsyncImage(
+                            model = profileAvatarUri,
+                            contentDescription = "个人头像",
+                            modifier = Modifier.fillMaxSize().clip(CircleShape),
+                            contentScale = ContentScale.Crop
+                        )
+                    } else {
+                        Icon(
+                            Icons.Filled.Person,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.padding(14.dp)
+                        )
+                    }
+                }
+                Column(
+                    modifier = Modifier.weight(1f).padding(horizontal = 14.dp)
+                ) {
+                    Text("个人头像", fontWeight = FontWeight.SemiBold)
+                    Text(
+                        if (profileAvatarUri == null) "上传一张图片作为应用头像"
+                        else "点击更换本地头像图片",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 3.dp)
+                    )
+                }
+                Column(horizontalAlignment = Alignment.End) {
+                    TextButton(onClick = onSelectProfileAvatar) {
+                        Text(if (profileAvatarUri == null) "上传" else "更换")
+                    }
+                    if (profileAvatarUri != null) {
+                        TextButton(onClick = onClearProfileAvatar) {
+                            Text("移除")
+                        }
+                    }
+                }
+            }
+        }
         ElevatedCard(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(20.dp)
@@ -4376,24 +7253,44 @@ private fun MiniPlayerCapsule(
     positionMs: Long,
     durationMs: Long,
     onOpen: () -> Unit,
+    onOpenAlbum: () -> Unit,
+    onOpenArtist: () -> Unit,
     onTogglePlayback: () -> Unit,
     onNext: () -> Unit,
-    onPrevious: () -> Unit
+    onPrevious: () -> Unit,
+    modifier: Modifier = Modifier,
+    compact: Boolean = false,
+    surfaceColor: Color? = null,
+    contentColor: Color? = null,
+    secondaryTextColor: Color? = null,
+    accentColorOverride: Color? = null
 ) {
     val progress = if (durationMs > 0L) {
         (positionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
     } else {
         0f
     }
-    val accentColor = MaterialTheme.colorScheme.primary
-    val trackColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.18f)
+    val playerAccentColor by animateColorAsState(
+        targetValue = accentColorOverride ?: MaterialTheme.colorScheme.primary,
+        animationSpec = tween(450),
+        label = "miniPlayerArtworkAccent"
+    )
+    val playerContentColor = contentColor ?: MaterialTheme.colorScheme.onSurface
+    val playerSecondaryColor = secondaryTextColor ?: MaterialTheme.colorScheme.onSurfaceVariant
+    val targetSurfaceColor = surfaceColor ?: MaterialTheme.colorScheme.surface.copy(alpha = 0.88f)
+    val playerSurfaceColor by animateColorAsState(
+        targetValue = targetSurfaceColor,
+        animationSpec = tween(450),
+        label = "miniPlayerSurfaceColor"
+    )
+    val playerSurfaceVariant = surfaceColor ?: MaterialTheme.colorScheme.surfaceVariant
+    val trackColor = playerContentColor.copy(alpha = 0.18f)
 
     Surface(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .widthIn(max = 360.dp)
-            .drawWithContent {
-                drawContent()
+            .drawWithCache {
                 val strokeWidth = 2.dp.toPx()
                 val inset = strokeWidth / 2f
                 val cornerRadius = 32.dp.toPx()
@@ -4412,29 +7309,45 @@ private fun MiniPlayerCapsule(
                 }
                 val pathMeasure = android.graphics.PathMeasure(path, false)
                 val pathLength = pathMeasure.length
-                if (pathLength > 0f) {
-                    val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
-                        style = android.graphics.Paint.Style.STROKE
-                        this.strokeWidth = strokeWidth
-                        strokeCap = android.graphics.Paint.Cap.ROUND
-                        color = trackColor.toArgb()
-                    }
-                    drawIntoCanvas { it.nativeCanvas.drawPath(path, paint) }
-                    if (progress > 0f) {
-                        val progressPath = android.graphics.Path()
-                        pathMeasure.getSegment(0f, pathLength * progress, progressPath, true)
-                        paint.color = accentColor.toArgb()
-                        drawIntoCanvas { it.nativeCanvas.drawPath(progressPath, paint) }
+                val progressPath = android.graphics.Path()
+                val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                    style = android.graphics.Paint.Style.STROKE
+                    this.strokeWidth = strokeWidth
+                    strokeCap = android.graphics.Paint.Cap.ROUND
+                }
+                onDrawWithContent {
+                    drawContent()
+                    if (pathLength > 0f) {
+                        paint.color = trackColor.toArgb()
+                        drawIntoCanvas { it.nativeCanvas.drawPath(path, paint) }
+                        if (progress > 0f) {
+                            progressPath.reset()
+                            pathMeasure.getSegment(
+                                0f,
+                                pathLength * progress,
+                                progressPath,
+                                true
+                            )
+                            paint.color = playerAccentColor.toArgb()
+                            drawIntoCanvas {
+                                it.nativeCanvas.drawPath(progressPath, paint)
+                            }
+                        }
                     }
                 }
             }
             .clickable(onClick = onOpen),
         shape = RoundedCornerShape(32.dp),
-        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.88f),
+        color = playerSurfaceColor,
         shadowElevation = 6.dp
     ) {
         Column(
-            modifier = Modifier.padding(start = 10.dp, top = 8.dp, end = 8.dp, bottom = 8.dp)
+            modifier = Modifier.padding(
+                start = if (compact) 6.dp else 10.dp,
+                top = if (compact) 5.dp else 8.dp,
+                end = if (compact) 5.dp else 8.dp,
+                bottom = if (compact) 5.dp else 8.dp
+            )
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -4442,9 +7355,9 @@ private fun MiniPlayerCapsule(
             ) {
                 Box(
                     modifier = Modifier
-                        .size(48.dp)
+                        .size(if (compact) 36.dp else 48.dp)
                         .clip(CircleShape)
-                        .background(MaterialTheme.colorScheme.surfaceVariant),
+                        .background(playerSurfaceVariant),
                     contentAlignment = Alignment.Center
                 ) {
                     if (song.artworkUrl.isNotBlank()) {
@@ -4474,7 +7387,7 @@ private fun MiniPlayerCapsule(
                         Icon(
                             Icons.Filled.MusicNote,
                             contentDescription = null,
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                            tint = playerSecondaryColor
                         )
                     }
                 }
@@ -4485,136 +7398,331 @@ private fun MiniPlayerCapsule(
                 ) {
                     Text(
                         song.title,
-                        color = MaterialTheme.colorScheme.onSurface,
+                        color = playerContentColor,
                         fontWeight = FontWeight.SemiBold,
                         maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.clickable(onClick = onOpenAlbum)
                     )
                     Text(
                         song.artist,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        color = playerSecondaryColor,
                         style = MaterialTheme.typography.bodySmall,
                         maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.clickable(onClick = onOpenArtist)
                     )
                 }
                 IconButton(
                     onClick = onTogglePlayback,
-                    modifier = Modifier.size(42.dp)
+                    modifier = Modifier.size(if (compact) 34.dp else 42.dp)
                 ) {
                     Icon(
                         imageVector = if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
                         contentDescription = if (isPlaying) "暂停播放" else "继续播放",
-                        tint = MaterialTheme.colorScheme.onSurface,
-                        modifier = Modifier.size(27.dp)
+                        tint = playerContentColor,
+                        modifier = Modifier.size(if (compact) 21.dp else 27.dp)
                     )
                 }
                 IconButton(
                     onClick = onNext,
-                    modifier = Modifier.size(42.dp)
+                    modifier = Modifier.size(if (compact) 34.dp else 42.dp)
                 ) {
                     Icon(
                         Icons.Filled.SkipNext,
                         contentDescription = "下一首",
-                        tint = MaterialTheme.colorScheme.onSurface,
-                        modifier = Modifier.size(25.dp)
+                        tint = playerContentColor,
+                        modifier = Modifier.size(if (compact) 20.dp else 25.dp)
                     )
                 }
             }
         }
     }
+}
+
+@Composable
+private fun CollapsingMiniPlayer(
+    song: SongHit?,
+    visible: Boolean,
+    isPlaying: Boolean,
+    positionMs: Long,
+    durationMs: Long,
+    progress: State<Float>,
+    expandedWidth: Dp,
+    artworkAccent: Color?,
+    onOpen: (SongHit) -> Unit,
+    onOpenAlbum: () -> Unit,
+    onOpenArtist: () -> Unit,
+    onTogglePlayback: () -> Unit,
+    onNext: () -> Unit,
+    onPrevious: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val density = androidx.compose.ui.platform.LocalDensity.current
+    AnimatedVisibility(
+        visible = visible && song != null,
+        enter = fadeIn(tween(220)) +
+            slideInVertically(
+                animationSpec = spring(dampingRatio = 0.84f, stiffness = 360f)
+            ) { it / 2 },
+        exit = fadeOut(tween(180)) +
+            slideOutVertically(
+                animationSpec = spring(dampingRatio = 0.88f, stiffness = 420f)
+            ) { it },
+        modifier = modifier
+            .graphicsLayer {
+                translationY = with(density) {
+                    -56.dp.toPx() * (
+                        1f - ((progress.value - 0.42f) / 0.58f).coerceIn(0f, 1f)
+                    )
+                }
+            }
+            .padding(
+                bottom = WindowInsets.navigationBars.asPaddingValues()
+                    .calculateBottomPadding() + 12.dp
+            )
+    ) {
+        song?.let { currentSong ->
+            val collapseProgress = progress.value.coerceIn(0f, 1f)
+            val capsuleWidthProgress = (collapseProgress / 0.42f).coerceIn(0f, 1f)
+            val songAccent = artworkAccent ?: MaterialTheme.colorScheme.primary
+            Box(
+                modifier = Modifier.fillMaxWidth().height(62.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                MiniPlayerCapsule(
+                    song = currentSong,
+                    isPlaying = isPlaying,
+                    positionMs = positionMs,
+                    durationMs = durationMs,
+                    onOpen = { onOpen(currentSong) },
+                    onOpenAlbum = onOpenAlbum,
+                    onOpenArtist = onOpenArtist,
+                    onTogglePlayback = onTogglePlayback,
+                    onNext = onNext,
+                    onPrevious = onPrevious,
+                    modifier = Modifier.width(
+                        lerp(expandedWidth, 250.dp, capsuleWidthProgress)
+                    ),
+                    compact = true,
+                    surfaceColor = lerp(Color(0xFF252527), songAccent, 0.28f)
+                        .copy(alpha = 0.94f),
+                    contentColor = Color.White,
+                    secondaryTextColor = Color.White.copy(alpha = 0.76f),
+                    accentColorOverride = songAccent
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun AnimatedFloatingNavigationBar(
+    selectedPage: ToolPage,
+    onSelect: (ToolPage) -> Unit,
+    collapseProgress: State<Float>,
+    darkTheme: Boolean,
+    expandedWidth: Dp,
+    collectionTheme: Boolean,
+    modifier: Modifier = Modifier
+) {
+    FloatingNavigationBar(
+        selectedPage = selectedPage,
+        onSelect = onSelect,
+        collapseProgress = collapseProgress.value,
+        darkTheme = darkTheme,
+        expandedWidth = expandedWidth,
+        collectionTheme = collectionTheme,
+        modifier = modifier
+    )
 }
 
 @Composable
 private fun FloatingNavigationBar(
     selectedPage: ToolPage,
     onSelect: (ToolPage) -> Unit,
+    collapseProgress: Float,
+    darkTheme: Boolean,
+    expandedWidth: Dp,
+    collectionTheme: Boolean = false,
     modifier: Modifier = Modifier
 ) {
-    Surface(
-        modifier = modifier,
-        shape = RoundedCornerShape(32.dp),
-        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.88f),
-        tonalElevation = 2.dp,
-        shadowElevation = 12.dp
+    val darkSurface = collectionTheme || (darkTheme && selectedPage != ToolPage.Settings)
+    val surfaceColor = if (collectionTheme) Color(0xD91C1C1E)
+    else if (darkSurface) Color(0xED2C2C2E)
+    else MaterialTheme.colorScheme.surface.copy(alpha = 0.9f)
+    val activePage = if (
+        selectedPage == ToolPage.Settings ||
+            selectedPage == ToolPage.Collection ||
+            selectedPage == ToolPage.Artist ||
+            selectedPage == ToolPage.ArtistTopSongs
+    ) ToolPage.Home else selectedPage
+    val progress = collapseProgress.coerceIn(0f, 1f)
+    val searchSize = lerp(54.dp, 50.dp, progress)
+    val spacing = lerp(8.dp, 6.dp, progress)
+    val dockWidth = lerp(expandedWidth, 362.dp, progress)
+    val navWidth = dockWidth - searchSize - spacing
+    val navHeight = lerp(54.dp, 50.dp, progress)
+    val navFade = (1f - progress / 0.78f).coerceIn(0f, 1f)
+    val collapsedHomeFade = ((progress - 0.62f) / 0.38f).coerceIn(0f, 1f)
+
+    Row(
+        modifier = modifier.width(dockWidth).height(62.dp),
+        horizontalArrangement = Arrangement.spacedBy(spacing),
+        verticalAlignment = Alignment.CenterVertically
     ) {
-        BoxWithConstraints(
-            modifier = Modifier
-                .width(240.dp)
-                .padding(horizontal = 6.dp, vertical = 6.dp)
+        Surface(
+            modifier = Modifier.size(searchSize).clickable { onSelect(ToolPage.Search) },
+            shape = CircleShape,
+            color = if (selectedPage == ToolPage.Search) {
+                when {
+                    collectionTheme -> Color.White.copy(alpha = 0.2f)
+                    darkSurface -> Color(0xFF48484A)
+                    else -> MaterialTheme.colorScheme.secondaryContainer
+                }
+            } else surfaceColor,
+            tonalElevation = 2.dp,
+            shadowElevation = 6.dp
         ) {
-            val indicatorOffset by animateDpAsState(
-                targetValue = if (selectedPage == ToolPage.Search) 0.dp else maxWidth / 2,
-                animationSpec = spring(
-                    dampingRatio = 0.72f,
-                    stiffness = 520f
-                ),
-                label = "navigationIndicator"
-            )
+            Box(contentAlignment = Alignment.Center) {
+                Icon(
+                    Icons.Filled.Search,
+                    contentDescription = "搜索",
+                    tint = if (darkSurface) Color.White else MaterialTheme.colorScheme.onSurface
+                )
+            }
+        }
+
+        Box(modifier = Modifier.width(navWidth).height(62.dp)) {
             Surface(
                 modifier = Modifier
-                    .align(Alignment.CenterStart)
-                    .offset(x = indicatorOffset)
-                    .width(maxWidth / 2)
-                    .height(48.dp),
-                shape = RoundedCornerShape(24.dp),
-                color = MaterialTheme.colorScheme.secondaryContainer
-            ) {}
-            Row(Modifier.fillMaxWidth()) {
-                NavigationPillItem(
-                    label = "主页",
-                    icon = Icons.Filled.Search,
-                    selected = selectedPage == ToolPage.Search,
-                    modifier = Modifier.weight(1f),
-                    onClick = { onSelect(ToolPage.Search) }
-                )
-                NavigationPillItem(
-                    label = "设置",
-                    icon = Icons.Filled.Settings,
-                    selected = selectedPage == ToolPage.Settings,
-                    modifier = Modifier.weight(1f),
-                    onClick = { onSelect(ToolPage.Settings) }
-                )
+                    .align(Alignment.CenterEnd)
+                    .width(lerp(290.dp, 50.dp, progress))
+                    .height(navHeight),
+                shape = RoundedCornerShape(lerp(27.dp, 25.dp, progress)),
+                color = surfaceColor,
+                tonalElevation = 2.dp,
+                shadowElevation = 6.dp
+            ) {
+                Box {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(4.dp)
+                            .graphicsLayer {
+                                alpha = navFade
+                                translationX = 54.dp.toPx() * progress
+                            },
+                        horizontalArrangement = Arrangement.SpaceEvenly,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        MusicNavigationItem(
+                            label = "主页",
+                            icon = Icons.Filled.Home,
+                            selected = activePage == ToolPage.Home,
+                            darkSurface = darkSurface,
+                            collectionTheme = collectionTheme,
+                            modifier = Modifier.weight(1f),
+                            onClick = { onSelect(ToolPage.Home) }
+                        )
+                        MusicNavigationItem(
+                            label = "新发现",
+                            icon = Icons.Filled.Explore,
+                            selected = activePage == ToolPage.Discovery,
+                            darkSurface = darkSurface,
+                            collectionTheme = collectionTheme,
+                            modifier = Modifier.weight(1f),
+                            onClick = { onSelect(ToolPage.Discovery) }
+                        )
+                        MusicNavigationItem(
+                            label = "电台",
+                            icon = Icons.Filled.GraphicEq,
+                            selected = activePage == ToolPage.Radio,
+                            darkSurface = darkSurface,
+                            collectionTheme = collectionTheme,
+                            modifier = Modifier.weight(1f),
+                            onClick = { onSelect(ToolPage.Radio) }
+                        )
+                        MusicNavigationItem(
+                            label = "资料库",
+                            icon = Icons.Filled.Storage,
+                            selected = activePage == ToolPage.Library,
+                            darkSurface = darkSurface,
+                            collectionTheme = collectionTheme,
+                            modifier = Modifier.weight(1f),
+                            onClick = { onSelect(ToolPage.Library) }
+                        )
+                    }
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.Center)
+                            .size(50.dp)
+                            .graphicsLayer { alpha = collapsedHomeFade }
+                            .clickable { onSelect(ToolPage.Home) },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            Icons.Filled.Home,
+                            contentDescription = "主页",
+                            tint = if (darkSurface) Color.White
+                            else MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                }
             }
         }
     }
 }
 
 @Composable
-private fun NavigationPillItem(
+private fun MusicNavigationItem(
     label: String,
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     selected: Boolean,
+    darkSurface: Boolean,
+    collectionTheme: Boolean,
     modifier: Modifier = Modifier,
     onClick: () -> Unit
 ) {
     val contentColor by animateColorAsState(
-        targetValue = if (selected) MaterialTheme.colorScheme.onSecondaryContainer
-        else MaterialTheme.colorScheme.onSurfaceVariant,
+        targetValue = when {
+            darkSurface && selected -> Color.White
+            darkSurface -> Color(0xFFB0B0B5)
+            selected -> MaterialTheme.colorScheme.onSecondaryContainer
+            else -> MaterialTheme.colorScheme.onSurfaceVariant
+        },
         animationSpec = tween(200),
         label = "navigationItemColor"
     )
     Box(
         modifier = Modifier
             .then(modifier)
-            .height(48.dp)
+            .height(54.dp)
             .clip(RoundedCornerShape(24.dp))
+            .background(
+                if (selected) {
+                    if (collectionTheme) Color.White.copy(alpha = 0.2f)
+                    else if (darkSurface) Color(0xFF48484A)
+                    else MaterialTheme.colorScheme.secondaryContainer
+                } else Color.Transparent
+            )
             .clickable(onClick = onClick),
         contentAlignment = Alignment.Center
     ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(2.dp)
         ) {
             Icon(
                 icon,
                 contentDescription = null,
-                tint = contentColor
+                tint = contentColor,
+                modifier = Modifier.size(20.dp)
             )
             Text(
                 label,
                 color = contentColor,
+                fontSize = 10.sp,
                 fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal
             )
         }

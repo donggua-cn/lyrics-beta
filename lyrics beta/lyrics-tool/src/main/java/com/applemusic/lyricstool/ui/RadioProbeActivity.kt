@@ -12,6 +12,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -21,6 +22,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
@@ -39,6 +41,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
@@ -57,12 +60,23 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 class RadioProbeActivity : ComponentActivity() {
+    companion object {
+        const val EXTRA_STATION_ID = "com.applemusic.lyricstool.extra.STATION_ID"
+        const val EXTRA_AUTO_PLAY = "com.applemusic.lyricstool.extra.AUTO_PLAY"
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val requestedStationId = intent.getStringExtra(EXTRA_STATION_ID)
+        val autoPlay = intent.getBooleanExtra(EXTRA_AUTO_PLAY, false)
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    RadioProbeScreen(onBack = ::finish)
+                    RadioProbeScreen(
+                        onBack = ::finish,
+                        requestedStationId = requestedStationId,
+                        autoPlay = autoPlay
+                    )
                 }
             }
         }
@@ -87,14 +101,22 @@ private data class RadioProbeResult(
     val error: String? = null
 )
 
-private data class RadioStartBatch(
+internal data class RadioStartBatch(
     val firstResponse: AppleApi.StationProbeResponse,
     val rows: List<AppleLibrarySync.SongRow>,
     val warning: String? = null
 )
 
+internal fun restoreNativeRadioPrefetch(context: Context, api: AppleApi) {
+    NativeRadioPlayback.restore(context.applicationContext, api)
+}
+
 @Composable
-private fun RadioProbeScreen(onBack: () -> Unit) {
+private fun RadioProbeScreen(
+    onBack: () -> Unit,
+    requestedStationId: String? = null,
+    autoPlay: Boolean = false
+) {
     val context = LocalContext.current
     val api = MusicRepository.api
     val scope = rememberCoroutineScope()
@@ -130,11 +152,19 @@ private fun RadioProbeScreen(onBack: () -> Unit) {
                             .distinctBy(ShelfItem::id)
                     }
                     stations = loaded
-                    selectedStation = loaded.firstOrNull()
-                    statusMessage = if (loaded.isEmpty()) {
-                        "推荐页没有返回电台卡片；请确认账号登录状态和 Apple Music storefront。"
+                    selectedStation = if (requestedStationId != null) {
+                        loaded.firstOrNull { it.id == requestedStationId }
                     } else {
-                        "找到 ${loaded.size} 个电台。"
+                        loaded.firstOrNull()
+                    }
+                    statusMessage = when {
+                        loaded.isEmpty() ->
+                            "推荐页没有返回电台卡片；请确认账号登录状态和 Apple Music storefront。"
+                        requestedStationId != null && selectedStation == null ->
+                            "没有在 Apple Music 推荐中找到对应电台（ID：$requestedStationId），未切换到其他电台。"
+                        requestedStationId != null ->
+                            "已绑定电台：${selectedStation?.title}（ID 与主页卡片一致）"
+                        else -> "找到 ${loaded.size} 个电台。"
                     }
                 } catch (error: CancellationException) {
                     throw error
@@ -287,7 +317,7 @@ private fun RadioProbeScreen(onBack: () -> Unit) {
     val playTrack: (RadioProbeTrack) -> Unit = { track ->
         if (preparingTrackId == null) {
             scope.launch {
-                NativeRadioPlayback.stop()
+                NativeRadioPlayback.stop(context.applicationContext)
                 radioActive = false
                 preparingTrackId = track.id
                 playbackMessage = "正在读取歌曲详情…"
@@ -354,81 +384,14 @@ private fun RadioProbeScreen(onBack: () -> Unit) {
                 prefetchStopRequested = false
                 startingRadio = true
                 playbackMessage = "正在向 Apple Music 请求电台首批曲目…"
-                NativeRadioPlayback.stop()
                 radioActive = false
                 try {
-                    val started = withContext(Dispatchers.IO) {
-                        val firstResponse = api.probeStationNextTracks(station.id)
-                        if (firstResponse.statusCode !in 200..299) {
-                            throw IllegalStateException(
-                                "电台首批请求失败，HTTP ${firstResponse.statusCode}：" +
-                                    firstResponse.body.take(300)
-                            )
-                        }
-                        val firstTracks = parseRadioTracks(firstResponse.body).first
-                        if (firstTracks.isEmpty()) {
-                            throw IllegalStateException("Apple Music 没有在首批响应中返回可播放歌曲")
-                        }
-                        val rows = ArrayList<AppleLibrarySync.SongRow>()
-                        val seen = firstTracks.mapTo(HashSet<String>()) { it.id }
-                        firstTracks.forEach { track ->
-                            val song = api.getCatalogSongLocalized(track.id)
-                                ?: throw IllegalStateException("无法读取歌曲目录详情：${track.id}")
-                            rows.add(AppleLibrarySync.toRow(song).also { it.isLibrary = false })
-                        }
-                        var duplicateResponses = 0
-                        var requests = 0
-                        var warning: String? = null
-                        while (
-                            rows.size < MIN_RADIO_QUEUE_TRACKS &&
-                            requests < MAX_RADIO_PREFETCH_REQUESTS &&
-                            !prefetchStopSignal.get()
-                        ) {
-                            requests++
-                            val requested = (MIN_RADIO_QUEUE_TRACKS - rows.size).coerceAtLeast(1)
-                            val nextResponse = api.probeStationNextTracks(
-                                station.id,
-                                limit = requested
-                            )
-                            if (nextResponse.statusCode !in 200..299) {
-                                warning = "后续预取失败，HTTP ${nextResponse.statusCode}"
-                                break
-                            }
-                            val nextTracks = parseRadioTracks(nextResponse.body).first
-                            if (nextTracks.isEmpty()) {
-                                warning = "Apple 没有再返回后续歌曲"
-                                break
-                            }
-                            var addedFromResponse = 0
-                            for (nextTrack in nextTracks) {
-                                if (!seen.add(nextTrack.id)) continue
-                                val song = api.getCatalogSongLocalized(nextTrack.id)
-                                    ?: throw IllegalStateException(
-                                        "无法读取后续歌曲详情：${nextTrack.id}"
-                                    )
-                                rows.add(
-                                    AppleLibrarySync.toRow(song).also { it.isLibrary = false }
-                                )
-                                addedFromResponse++
-                                if (rows.size >= MIN_RADIO_QUEUE_TRACKS) break
-                            }
-                            if (addedFromResponse == 0) {
-                                duplicateResponses++
-                                if (duplicateResponses >= MAX_RADIO_DUPLICATE_RESPONSES) {
-                                    warning = "Apple 连续返回重复歌曲，预取已停止"
-                                    break
-                                }
-                            } else {
-                                duplicateResponses = 0
-                            }
-                        }
-                        if (prefetchStopSignal.get()) {
-                            warning = "已手动停止预取"
-                        } else if (rows.size < MIN_RADIO_QUEUE_TRACKS && warning == null) {
-                            warning = "最多预取 $MAX_RADIO_PREFETCH_REQUESTS 次后仍不足 $MIN_RADIO_QUEUE_TRACKS 首"
-                        }
-                        RadioStartBatch(firstResponse, rows, warning)
-                    }
+                    val started = startRecommendedRadio(
+                        context.applicationContext,
+                        api,
+                        station.id,
+                        prefetchStopSignal
+                    )
                     results = listOf(
                         RadioProbeResult(
                             label = "原生电台首批响应",
@@ -441,18 +404,12 @@ private fun RadioProbeScreen(onBack: () -> Unit) {
                             responsePreview = started.firstResponse.body.take(MAX_RESPONSE_PREVIEW_CHARS)
                         )
                     )
-                    NativeRadioPlayback.start(
-                        context.applicationContext,
-                        api,
-                        station.id,
-                        started.rows,
-                        enablePrefetch = !prefetchStopSignal.get()
-                    )
                     radioActive = true
                     playbackMessage =
                         "Apple 原生电台已开始：共 ${started.rows.size} 首已加入队列，" +
                             "其中 ${maxOf(0, started.rows.size - 1)} 首为后续曲目。" +
                             (started.warning?.let { "\n$it" } ?: "")
+                    if (autoPlay) onBack()
                 } catch (error: CancellationException) {
                     throw error
                 } catch (error: Exception) {
@@ -466,6 +423,12 @@ private fun RadioProbeScreen(onBack: () -> Unit) {
         }
     }
 
+    androidx.compose.runtime.LaunchedEffect(autoPlay, selectedStation?.id, loadingStations) {
+        if (autoPlay && selectedStation != null && !loadingStations) {
+            startRadio()
+        }
+    }
+
     val stopPrefetch: () -> Unit = {
         prefetchStopRequested = true
         prefetchStopSignal.set(true)
@@ -475,7 +438,37 @@ private fun RadioProbeScreen(onBack: () -> Unit) {
         }
     }
 
-    Column(
+    if (autoPlay) {
+        Box(
+            modifier = Modifier.fillMaxSize(),
+            contentAlignment = Alignment.Center
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                if (
+                    !loadingStations &&
+                    selectedStation == null &&
+                    statusMessage.isNotBlank()
+                ) {
+                    Text(statusMessage, color = MaterialTheme.colorScheme.error)
+                } else if (startingRadio || loadingStations || selectedStation == null) {
+                    CircularProgressIndicator()
+                    Text(
+                        if (startingRadio) "正在启动电台…" else "正在连接 Apple Music 电台…",
+                        modifier = Modifier.padding(top = 16.dp)
+                    )
+                } else {
+                    Text(
+                        playbackMessage.ifBlank { statusMessage },
+                        color = if (playbackMessage.startsWith("无法启动")) {
+                            MaterialTheme.colorScheme.error
+                        } else {
+                            MaterialTheme.colorScheme.onSurface
+                        }
+                    )
+                }
+            }
+        }
+    } else Column(
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
@@ -807,7 +800,93 @@ private fun localizeRadioTracks(
     return localized to warnings.take(3).joinToString("\n").ifEmpty { null }
 }
 
+internal suspend fun startRecommendedRadio(
+    context: Context,
+    api: AppleApi,
+    stationId: String,
+    stopSignal: AtomicBoolean = AtomicBoolean(false)
+): RadioStartBatch {
+    NativeRadioPlayback.stop(context.applicationContext)
+    val started = withContext(Dispatchers.IO) {
+        val firstResponse = api.probeStationNextTracks(stationId)
+        if (firstResponse.statusCode !in 200..299) {
+            throw IllegalStateException(
+                "电台首批请求失败，HTTP ${firstResponse.statusCode}：" +
+                    firstResponse.body.take(300)
+            )
+        }
+        val firstTracks = parseRadioTracks(firstResponse.body).first
+        if (firstTracks.isEmpty()) {
+            throw IllegalStateException("Apple Music 没有在首批响应中返回可播放歌曲")
+        }
+        val rows = ArrayList<AppleLibrarySync.SongRow>()
+        val seen = firstTracks.mapTo(HashSet<String>()) { it.id }
+        firstTracks.forEach { track ->
+            val song = api.getCatalogSongLocalized(track.id)
+                ?: throw IllegalStateException("无法读取歌曲目录详情：${track.id}")
+            rows.add(AppleLibrarySync.toRow(song).also { it.isLibrary = false })
+        }
+        var duplicateResponses = 0
+        var requests = 0
+        var warning: String? = null
+        while (
+            rows.size < MIN_RADIO_QUEUE_TRACKS &&
+            requests < MAX_RADIO_PREFETCH_REQUESTS &&
+            !stopSignal.get()
+        ) {
+            requests++
+            val requested = (MIN_RADIO_QUEUE_TRACKS - rows.size).coerceAtLeast(1)
+            val nextResponse = api.probeStationNextTracks(stationId, limit = requested)
+            if (nextResponse.statusCode !in 200..299) {
+                warning = "后续预取失败，HTTP ${nextResponse.statusCode}"
+                break
+            }
+            val nextTracks = parseRadioTracks(nextResponse.body).first
+            if (nextTracks.isEmpty()) {
+                warning = "Apple 没有再返回后续歌曲"
+                break
+            }
+            var addedFromResponse = 0
+            for (nextTrack in nextTracks) {
+                if (!seen.add(nextTrack.id)) continue
+                val song = api.getCatalogSongLocalized(nextTrack.id)
+                    ?: throw IllegalStateException("无法读取后续歌曲详情：${nextTrack.id}")
+                rows.add(AppleLibrarySync.toRow(song).also { it.isLibrary = false })
+                addedFromResponse++
+                if (rows.size >= MIN_RADIO_QUEUE_TRACKS) break
+            }
+            if (addedFromResponse == 0) {
+                duplicateResponses++
+                if (duplicateResponses >= MAX_RADIO_DUPLICATE_RESPONSES) {
+                    warning = "Apple 连续返回重复歌曲，预取已停止"
+                    break
+                }
+            } else {
+                duplicateResponses = 0
+            }
+        }
+        if (stopSignal.get()) {
+            warning = "已手动停止预取"
+        } else if (rows.size < MIN_RADIO_QUEUE_TRACKS && warning == null) {
+            warning = "最多预取 $MAX_RADIO_PREFETCH_REQUESTS 次后仍不足 $MIN_RADIO_QUEUE_TRACKS 首"
+        }
+        RadioStartBatch(firstResponse, rows, warning)
+    }
+    NativeRadioPlayback.start(
+        context.applicationContext,
+        api,
+        stationId,
+        started.rows,
+        enablePrefetch = !stopSignal.get()
+    )
+    return started
+}
+
 private object NativeRadioPlayback {
+    private const val RADIO_PREFERENCES = "native_radio_playback"
+    private const val RADIO_STATION_KEY = "station_id"
+    private const val RADIO_PREFETCH_KEY = "prefetch_enabled"
+
     private val executor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "apple-radio-next").apply { isDaemon = true }
     }
@@ -840,6 +919,7 @@ private object NativeRadioPlayback {
         api = stationApi
         activeStationId = stationId
         prefetchEnabled = enablePrefetch
+        persistRadioState()
         generation.incrementAndGet()
         synchronized(seenSongIds) {
             seenSongIds.clear()
@@ -873,7 +953,7 @@ private object NativeRadioPlayback {
         enablePrefetch: Boolean = true
     ) {
         require(initialRows.isNotEmpty()) { "Apple 电台没有返回可播放歌曲" }
-        stop()
+        stop(context)
         synchronized(seenSongIds) {
             seenSongIds.clear()
             initialRows.forEach { seenSongIds.add(it.appleId) }
@@ -882,6 +962,7 @@ private object NativeRadioPlayback {
         api = stationApi
         activeStationId = stationId
         prefetchEnabled = enablePrefetch
+        persistRadioState()
         generation.incrementAndGet()
         MusicRepository.registerTransient(initialRows)
         PlaybackEngine.onQueueLow = if (enablePrefetch) {
@@ -894,16 +975,56 @@ private object NativeRadioPlayback {
 
     fun stopPrefetch() {
         prefetchEnabled = false
+        persistRadioState()
         PlaybackEngine.onQueueLow = null
     }
 
-    fun stop() {
+    fun stop(context: Context? = null) {
         activeStationId = ""
         prefetchEnabled = false
+        (context?.applicationContext ?: appContext)
+            ?.getSharedPreferences(RADIO_PREFERENCES, Context.MODE_PRIVATE)
+            ?.edit()
+            ?.clear()
+            ?.apply()
         generation.incrementAndGet()
         if (PlaybackEngine.onQueueLow != null) {
             PlaybackEngine.onQueueLow = null
         }
+    }
+
+    fun restore(context: Context, stationApi: AppleApi) {
+        val preferences = context.getSharedPreferences(RADIO_PREFERENCES, Context.MODE_PRIVATE)
+        val stationId = preferences.getString(RADIO_STATION_KEY, "").orEmpty()
+        if (stationId.isBlank() || !preferences.getBoolean(RADIO_PREFETCH_KEY, false)) return
+        if (PlaybackEngine.queueSnapshot().isEmpty()) return
+
+        appContext = context.applicationContext
+        api = stationApi
+        activeStationId = stationId
+        prefetchEnabled = true
+        synchronized(seenSongIds) {
+            seenSongIds.clear()
+            PlaybackEngine.queueSnapshot().forEach { uri ->
+                MusicRepository.findSong(uri)?.let { row ->
+                    seenSongIds.add(row.appleId.ifBlank { row.catalogId })
+                }
+            }
+        }
+        PlaybackEngine.onQueueLow = { requestNextBatch(MIN_RADIO_UPCOMING_TRACKS) }
+        if (PlaybackEngine.queueRemaining() <= MIN_RADIO_UPCOMING_TRACKS) {
+            requestNextBatch(MIN_RADIO_UPCOMING_TRACKS)
+        }
+        Log.i("NativeRadioPlayback", "已恢复电台预取：$stationId")
+    }
+
+    private fun persistRadioState() {
+        val context = appContext ?: return
+        context.getSharedPreferences(RADIO_PREFERENCES, Context.MODE_PRIVATE)
+            .edit()
+            .putString(RADIO_STATION_KEY, activeStationId)
+            .putBoolean(RADIO_PREFETCH_KEY, prefetchEnabled)
+            .apply()
     }
 
     private fun requestNextBatch(minimumUpcoming: Int = MIN_RADIO_UPCOMING_TRACKS) {
